@@ -1,0 +1,67 @@
+# Shared Neon preview branches: one `preview/pr-<number>-<head-ref>` branch
+# per same-repo PR, created on open/reopen and deleted on close. ci.yml's e2e
+# job reuses the same branch name.
+#
+# Callers:
+#   on:
+#     pull_request:
+#       types: [opened, reopened, closed]
+#   jobs:
+#     neon:
+#       uses: crashoutcompany/.github/.github/workflows/neon-branches.yml@v1
+#       secrets: inherit
+#
+# Reads NEON_API_KEY and NEON_PROJECT_ID (secret or var), plus optional
+# NEON_DATABASE / NEON_ROLE (secret or var) from the calling repository.
+name: neon-branches
+
+on:
+  workflow_call:
+    inputs:
+      neon-database:
+        description: Fallback when NEON_DATABASE is not set as a secret or variable.
+        type: string
+        default: neondb
+      neon-role:
+        description: Fallback when NEON_ROLE is not set as a secret or variable.
+        type: string
+        default: neondb_owner
+
+jobs:
+  create:
+    if: github.event.action != 'closed' && github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve Neon branch
+        id: neon
+        env:
+          PR_NUMBER: ${{ github.event.number }}
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          safe_ref="${HEAD_REF//\//-}"
+          printf 'name=preview/pr-%s-%s\n' "$PR_NUMBER" "$safe_ref" >> "$GITHUB_OUTPUT"
+      - uses: neondatabase/create-branch-action@v6
+        with:
+          project_id: ${{ secrets.NEON_PROJECT_ID || vars.NEON_PROJECT_ID }}
+          branch_name: ${{ steps.neon.outputs.name }}
+          api_key: ${{ secrets.NEON_API_KEY }}
+          database: ${{ secrets.NEON_DATABASE || vars.NEON_DATABASE || inputs.neon-database }}
+          role: ${{ secrets.NEON_ROLE || vars.NEON_ROLE || inputs.neon-role }}
+
+  delete:
+    if: github.event.action == 'closed' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve Neon branch
+        id: neon
+        env:
+          PR_NUMBER: ${{ github.event.number }}
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          safe_ref="${HEAD_REF//\//-}"
+          printf 'name=preview/pr-%s-%s\n' "$PR_NUMBER" "$safe_ref" >> "$GITHUB_OUTPUT"
+      - uses: neondatabase/delete-branch-action@v3
+        with:
+          project_id: ${{ secrets.NEON_PROJECT_ID || vars.NEON_PROJECT_ID }}
+          branch: ${{ steps.neon.outputs.name }}
+          api_key: ${{ secrets.NEON_API_KEY }}

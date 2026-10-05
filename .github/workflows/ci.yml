@@ -1,0 +1,298 @@
+# Shared CI for crashoutcompany Next.js apps.
+#
+# Callers:
+#   jobs:
+#     ci:
+#       uses: crashoutcompany/.github/.github/workflows/ci.yml@v1
+#       with: { ... }
+#       secrets: inherit
+#
+# Jobs: lint (+ typecheck) -> unit tests -> Vercel build -> Playwright e2e on a
+# Neon branch. Build and e2e are skipped for fork PRs and Dependabot because
+# they need repository secrets.
+#
+# Secrets / variables read from the calling repository:
+#   VERCEL_TOKEN, VERCEL_ORG_ID, VERCEL_PROJECT_ID   (build)
+#   NEON_API_KEY, NEON_PROJECT_ID (secret or var)    (e2e)
+#   NEON_DATABASE, NEON_ROLE (optional, secret or var; else inputs)
+#   Any names listed in `e2e-secrets`                (e2e)
+name: ci
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        type: string
+        default: "24"
+      pnpm-version:
+        type: string
+        default: "10.1.0"
+      install-flags:
+        description: Extra flags for `pnpm install --frozen-lockfile`.
+        type: string
+        default: ""
+      needs-prisma:
+        description: Run `prisma db push` + `prisma generate --sql` against the CI Postgres before lint/test.
+        type: boolean
+        default: false
+      has-typecheck:
+        type: boolean
+        default: true
+      test-script:
+        description: package.json script for unit tests.
+        type: string
+        default: test
+      has-build:
+        description: Run `vercel build` against the pulled Vercel environment.
+        type: boolean
+        default: true
+      has-e2e:
+        type: boolean
+        default: false
+      use-prisma-neon:
+        description: Ask create-branch-action for Prisma-shaped connection URLs.
+        type: boolean
+        default: false
+      sync-prisma-neon:
+        description: Run `prisma db push` + `prisma generate --sql` on the Neon branch before e2e.
+        type: boolean
+        default: false
+      neon-database:
+        description: Fallback when NEON_DATABASE is not set as a secret or variable.
+        type: string
+        default: neondb
+      neon-role:
+        description: Fallback when NEON_ROLE is not set as a secret or variable.
+        type: string
+        default: neondb_owner
+      e2e-better-auth-url:
+        description: BETTER_AUTH_URL for the e2e server. Empty leaves it unset.
+        type: string
+        default: ""
+      e2e-secrets:
+        description: Space-separated repository secret names to expose to the e2e job.
+        type: string
+        default: ""
+
+env:
+  # Fixtures for lint/test against the job's Postgres service. Not real secrets.
+  DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/ci?schema=public
+  DIRECT_URL: postgresql://postgres:postgres@127.0.0.1:5432/ci?schema=public
+  BETTER_AUTH_SECRET: ci-only-better-auth-secret-at-least-32-characters
+  TEST_AUTH_SECRET: ci-only-test-auth-secret
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ inputs.pnpm-version }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile ${{ inputs.install-flags }}
+      - name: Apply Prisma schema
+        if: inputs.needs-prisma
+        run: |
+          pnpm exec prisma db push
+          pnpm exec prisma generate --sql
+      - run: pnpm lint
+      - name: Typecheck
+        if: inputs.has-typecheck
+        run: pnpm typecheck
+
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ inputs.pnpm-version }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile ${{ inputs.install-flags }}
+      - name: Apply Prisma schema
+        if: inputs.needs-prisma
+        run: |
+          pnpm exec prisma db push
+          pnpm exec prisma generate --sql
+      - run: pnpm ${{ inputs.test-script }}
+
+  build:
+    if: inputs.has-build && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]'))
+    runs-on: ubuntu-latest
+    env:
+      VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+      VERCEL_ENV: ${{ github.event_name == 'push' && 'production' || 'preview' }}
+      ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+      PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ inputs.pnpm-version }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile ${{ inputs.install-flags }}
+      - run: pnpm add --global vercel@latest
+      - name: Pull Vercel environment and build
+        run: |
+          # App env must come from `vercel pull` (what Vercel itself builds
+          # with). vercel build never overrides an already-set variable, so
+          # drop the CI fixtures; a var missing on Vercel then fails loudly.
+          unset DATABASE_URL DIRECT_URL BETTER_AUTH_SECRET TEST_AUTH_SECRET
+          # Only export the IDs when both are set; otherwise fall back to the
+          # repo's .vercel/project.json link.
+          if [ -n "$ORG_ID" ] && [ -n "$PROJECT_ID" ]; then
+            export VERCEL_ORG_ID="$ORG_ID" VERCEL_PROJECT_ID="$PROJECT_ID"
+          fi
+          vercel pull --yes --environment="$VERCEL_ENV" --token="$VERCEL_TOKEN"
+          if [ "$VERCEL_ENV" = "production" ]; then
+            vercel build --prod --token="$VERCEL_TOKEN"
+          else
+            vercel build --token="$VERCEL_TOKEN"
+          fi
+
+  e2e:
+    if: inputs.has-e2e && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ inputs.pnpm-version }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: pnpm
+
+      - name: Expose requested secrets
+        if: inputs.e2e-secrets != ''
+        env:
+          ALL_SECRETS: ${{ toJSON(secrets) }}
+          NAMES: ${{ inputs.e2e-secrets }}
+        run: |
+          for name in $NAMES; do
+            value="$(jq -r --arg n "$name" '.[$n] // empty' <<<"$ALL_SECRETS")"
+            if [ -z "$value" ]; then
+              echo "::warning::Secret $name is not set"
+              continue
+            fi
+            delim="EOF_$(openssl rand -hex 8)"
+            printf '%s<<%s\n%s\n%s\n' "$name" "$delim" "$value" "$delim" >> "$GITHUB_ENV"
+          done
+
+      # PRs share the long-lived preview/pr-* branch managed by
+      # neon-branches.yml; pushes get a throwaway branch deleted below.
+      - name: Resolve Neon branch
+        id: neon
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.number }}
+          HEAD_REF: ${{ github.head_ref }}
+          GIT_SHA: ${{ github.sha }}
+        run: |
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            safe_ref="${HEAD_REF//\//-}"
+            printf 'name=preview/pr-%s-%s\n' "$PR_NUMBER" "$safe_ref" >> "$GITHUB_OUTPUT"
+            printf 'ephemeral=false\n' >> "$GITHUB_OUTPUT"
+          else
+            printf 'name=ci/e2e-%s\n' "$GIT_SHA" >> "$GITHUB_OUTPUT"
+            printf 'ephemeral=true\n' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create or reuse Neon branch
+        id: database
+        uses: neondatabase/create-branch-action@v6
+        with:
+          project_id: ${{ secrets.NEON_PROJECT_ID || vars.NEON_PROJECT_ID }}
+          branch_name: ${{ steps.neon.outputs.name }}
+          api_key: ${{ secrets.NEON_API_KEY }}
+          database: ${{ secrets.NEON_DATABASE || vars.NEON_DATABASE || inputs.neon-database }}
+          role: ${{ secrets.NEON_ROLE || vars.NEON_ROLE || inputs.neon-role }}
+          prisma: ${{ inputs.use-prisma-neon }}
+
+      - name: Install dependencies
+        env:
+          DATABASE_URL: ${{ steps.database.outputs.db_url_pooled }}
+          DIRECT_URL: ${{ steps.database.outputs.db_url }}
+        run: pnpm install --frozen-lockfile
+
+      - name: Sync Prisma schema to Neon branch
+        if: inputs.sync-prisma-neon
+        env:
+          DATABASE_URL: ${{ steps.database.outputs.db_url_pooled }}
+          DIRECT_URL: ${{ steps.database.outputs.db_url }}
+        run: |
+          pnpm exec prisma db push
+          pnpm exec prisma generate --sql
+
+      - name: Install Playwright Chromium
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Run authenticated E2E
+        env:
+          DATABASE_URL: ${{ steps.database.outputs.db_url_pooled }}
+          DIRECT_URL: ${{ steps.database.outputs.db_url }}
+          EXPOSE_TESTING_API: "1"
+          E2E_BETTER_AUTH_URL: ${{ inputs.e2e-better-auth-url }}
+        run: |
+          if [ -n "$E2E_BETTER_AUTH_URL" ]; then
+            export BETTER_AUTH_URL="$E2E_BETTER_AUTH_URL"
+          fi
+          pnpm test:e2e
+
+      - name: Upload Playwright report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: |
+            playwright-report/
+            test-results/
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Delete ephemeral Neon branch
+        if: always() && steps.neon.outputs.ephemeral == 'true' && steps.database.outcome == 'success'
+        uses: neondatabase/delete-branch-action@v3
+        with:
+          project_id: ${{ secrets.NEON_PROJECT_ID || vars.NEON_PROJECT_ID }}
+          branch: ${{ steps.database.outputs.branch_id }}
+          api_key: ${{ secrets.NEON_API_KEY }}
