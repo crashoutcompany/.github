@@ -19,13 +19,13 @@ on:
   workflow_call:
     inputs:
       neon-database:
-        description: Fallback when NEON_DATABASE is not set as a secret or variable.
+        description: Neon database name. Overrides NEON_DATABASE; empty uses NEON_DATABASE (secret or variable), then neondb.
         type: string
-        default: neondb
+        default: ""
       neon-role:
-        description: Fallback when NEON_ROLE is not set as a secret or variable.
+        description: Neon role name. Overrides NEON_ROLE; empty uses NEON_ROLE (secret or variable), then neondb_owner.
         type: string
-        default: neondb_owner
+        default: ""
 
 jobs:
   create:
@@ -45,8 +45,8 @@ jobs:
           project_id: ${{ secrets.NEON_PROJECT_ID || vars.NEON_PROJECT_ID }}
           branch_name: ${{ steps.neon.outputs.name }}
           api_key: ${{ secrets.NEON_API_KEY }}
-          database: ${{ secrets.NEON_DATABASE || vars.NEON_DATABASE || inputs.neon-database }}
-          role: ${{ secrets.NEON_ROLE || vars.NEON_ROLE || inputs.neon-role }}
+          database: ${{ inputs.neon-database || secrets.NEON_DATABASE || vars.NEON_DATABASE || 'neondb' }}
+          role: ${{ inputs.neon-role || secrets.NEON_ROLE || vars.NEON_ROLE || 'neondb_owner' }}
 
   delete:
     if: github.event.action == 'closed' && github.event.pull_request.head.repo.full_name == github.repository

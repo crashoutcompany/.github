@@ -14,7 +14,8 @@
 # Secrets / variables read from the calling repository:
 #   VERCEL_TOKEN, VERCEL_ORG_ID, VERCEL_PROJECT_ID   (build)
 #   NEON_API_KEY, NEON_PROJECT_ID (secret or var)    (e2e)
-#   NEON_DATABASE, NEON_ROLE (optional, secret or var; else inputs)
+#   NEON_DATABASE, NEON_ROLE (optional, secret or var; `neon-database` / `neon-role` inputs win)
+#   DATABASE_URL, DIRECT_URL, BETTER_AUTH_SECRET, TEST_AUTH_SECRET (optional; else Vercel, else CI-only value)
 #   Any names listed in `e2e-secrets`                (e2e)
 name: ci
 
@@ -58,13 +59,13 @@ on:
         type: boolean
         default: false
       neon-database:
-        description: Fallback when NEON_DATABASE is not set as a secret or variable.
+        description: Neon database name. Overrides NEON_DATABASE; empty uses NEON_DATABASE (secret or variable), then neondb.
         type: string
-        default: neondb
+        default: ""
       neon-role:
-        description: Fallback when NEON_ROLE is not set as a secret or variable.
+        description: Neon role name. Overrides NEON_ROLE; empty uses NEON_ROLE (secret or variable), then neondb_owner.
         type: string
-        default: neondb_owner
+        default: ""
       e2e-better-auth-url:
         description: BETTER_AUTH_URL for the e2e server. Empty leaves it unset.
         type: string
@@ -159,6 +160,11 @@ jobs:
       VERCEL_ENV: ${{ github.event_name == 'push' && 'production' || 'preview' }}
       ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
       PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+      # Optional repo secrets; blank ones are unset below so Vercel's value wins.
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      DIRECT_URL: ${{ secrets.DIRECT_URL }}
+      BETTER_AUTH_SECRET: ${{ secrets.BETTER_AUTH_SECRET }}
+      TEST_AUTH_SECRET: ${{ secrets.TEST_AUTH_SECRET }}
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -172,16 +178,31 @@ jobs:
       - run: pnpm add --global vercel@latest
       - name: Pull Vercel environment and build
         run: |
-          # App env must come from `vercel pull` (what Vercel itself builds
-          # with). vercel build never overrides an already-set variable, so
-          # drop the CI fixtures; a var missing on Vercel then fails loudly.
-          unset DATABASE_URL DIRECT_URL BETTER_AUTH_SECRET TEST_AUTH_SECRET
+          # `vercel build` never overrides a variable that is already set, even
+          # to "", so only keep the repo secrets that actually have a value.
+          for k in DATABASE_URL DIRECT_URL BETTER_AUTH_SECRET TEST_AUTH_SECRET; do
+            [ -n "${!k:-}" ] || unset "$k"
+          done
           # Only export the IDs when both are set; otherwise fall back to the
           # repo's .vercel/project.json link.
           if [ -n "$ORG_ID" ] && [ -n "$PROJECT_ID" ]; then
             export VERCEL_ORG_ID="$ORG_ID" VERCEL_PROJECT_ID="$PROJECT_ID"
           fi
           vercel pull --yes --environment="$VERCEL_ENV" --token="$VERCEL_TOKEN"
+
+          # Vercel Sensitive variables are write-only: `vercel pull` writes them
+          # blank. This build is only a compile check (the output is never
+          # deployed), so fill in a CI-only value when nothing real is available.
+          envfile=".vercel/.env.${VERCEL_ENV}.local"
+          ensure() {
+            if [ -z "${!1:-}" ] && ! grep -Eq "^$1=\"?[^\"[:space:]]" "$envfile"; then
+              echo "::notice::$1 is not readable from Vercel (Sensitive?); using a CI-only value for this compile check"
+              printf '\n%s="%s"\n' "$1" "$2" >> "$envfile"
+            fi
+          }
+          ensure BETTER_AUTH_SECRET ci-only-better-auth-secret-at-least-32-characters
+          ensure TEST_AUTH_SECRET ci-only-test-auth-secret
+
           if [ "$VERCEL_ENV" = "production" ]; then
             vercel build --prod --token="$VERCEL_TOKEN"
           else
@@ -244,8 +265,8 @@ jobs:
           project_id: ${{ secrets.NEON_PROJECT_ID || vars.NEON_PROJECT_ID }}
           branch_name: ${{ steps.neon.outputs.name }}
           api_key: ${{ secrets.NEON_API_KEY }}
-          database: ${{ secrets.NEON_DATABASE || vars.NEON_DATABASE || inputs.neon-database }}
-          role: ${{ secrets.NEON_ROLE || vars.NEON_ROLE || inputs.neon-role }}
+          database: ${{ inputs.neon-database || secrets.NEON_DATABASE || vars.NEON_DATABASE || 'neondb' }}
+          role: ${{ inputs.neon-role || secrets.NEON_ROLE || vars.NEON_ROLE || 'neondb_owner' }}
           prisma: ${{ inputs.use-prisma-neon }}
 
       - name: Install dependencies
