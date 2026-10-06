@@ -13,6 +13,9 @@
 #
 # Reads NEON_API_KEY and NEON_PROJECT_ID (secret or var), plus optional
 # NEON_DATABASE / NEON_ROLE (secret or var) from the calling repository.
+# Requires NEON_CI_PARENT_BRANCH (var) or the `neon-parent` input: a
+# seeded/scrubbed branch, never production, because PR code runs against
+# branches copied from it.
 name: neon-branches
 
 on:
@@ -24,6 +27,10 @@ on:
         default: ""
       neon-role:
         description: Neon role name. Overrides NEON_ROLE; empty uses NEON_ROLE (secret or variable), then neondb_owner.
+        type: string
+        default: ""
+      neon-parent:
+        description: Neon branch that PR branches are created from. Overrides NEON_CI_PARENT_BRANCH (variable). Required.
         type: string
         default: ""
 
@@ -40,10 +47,21 @@ jobs:
         run: |
           safe_ref="${HEAD_REF//\//-}"
           printf 'name=preview/pr-%s-%s\n' "$PR_NUMBER" "$safe_ref" >> "$GITHUB_OUTPUT"
+      # Without an explicit parent, Neon copies the project's default branch,
+      # which is production data. Fail instead of silently doing that.
+      - name: Require Neon CI parent branch
+        env:
+          NEON_PARENT: ${{ inputs.neon-parent || vars.NEON_CI_PARENT_BRANCH }}
+        run: |
+          if [ -z "$NEON_PARENT" ]; then
+            echo "::error::Set the NEON_CI_PARENT_BRANCH repository variable (or the neon-parent input) to a seeded/scrubbed Neon branch. PR branches must not be copied from production."
+            exit 1
+          fi
       - uses: neondatabase/create-branch-action@v6
         with:
           project_id: ${{ secrets.NEON_PROJECT_ID || vars.NEON_PROJECT_ID }}
           branch_name: ${{ steps.neon.outputs.name }}
+          parent_branch: ${{ inputs.neon-parent || vars.NEON_CI_PARENT_BRANCH }}
           api_key: ${{ secrets.NEON_API_KEY }}
           database: ${{ inputs.neon-database || secrets.NEON_DATABASE || vars.NEON_DATABASE || 'neondb' }}
           role: ${{ inputs.neon-role || secrets.NEON_ROLE || vars.NEON_ROLE || 'neondb_owner' }}

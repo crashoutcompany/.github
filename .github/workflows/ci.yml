@@ -15,6 +15,9 @@
 #   VERCEL_TOKEN, VERCEL_ORG_ID, VERCEL_PROJECT_ID   (build)
 #   NEON_API_KEY, NEON_PROJECT_ID (secret or var)    (e2e)
 #   NEON_DATABASE, NEON_ROLE (optional, secret or var; `neon-database` / `neon-role` inputs win)
+#   NEON_CI_PARENT_BRANCH (var, required for e2e; `neon-parent` input wins).
+#     Point it at a seeded/scrubbed branch, never the production branch:
+#     PR code runs against branches copied from it.
 #   DATABASE_URL, DIRECT_URL, BETTER_AUTH_SECRET, TEST_AUTH_SECRET (optional; else Vercel, else CI-only value)
 #   Any names listed in `e2e-secrets`                (e2e)
 name: ci
@@ -64,6 +67,10 @@ on:
         default: ""
       neon-role:
         description: Neon role name. Overrides NEON_ROLE; empty uses NEON_ROLE (secret or variable), then neondb_owner.
+        type: string
+        default: ""
+      neon-parent:
+        description: Neon branch that e2e branches are created from. Overrides NEON_CI_PARENT_BRANCH (variable). Required when has-e2e is true, so CI never silently copies the production branch.
         type: string
         default: ""
       e2e-better-auth-url:
@@ -258,12 +265,24 @@ jobs:
             printf 'ephemeral=true\n' >> "$GITHUB_OUTPUT"
           fi
 
+      # Without an explicit parent, Neon copies the project's default branch,
+      # which is production data. Fail instead of silently doing that.
+      - name: Require Neon CI parent branch
+        env:
+          NEON_PARENT: ${{ inputs.neon-parent || vars.NEON_CI_PARENT_BRANCH }}
+        run: |
+          if [ -z "$NEON_PARENT" ]; then
+            echo "::error::Set the NEON_CI_PARENT_BRANCH repository variable (or the neon-parent input) to a seeded/scrubbed Neon branch. PR branches must not be copied from production."
+            exit 1
+          fi
+
       - name: Create or reuse Neon branch
         id: database
         uses: neondatabase/create-branch-action@v6
         with:
           project_id: ${{ secrets.NEON_PROJECT_ID || vars.NEON_PROJECT_ID }}
           branch_name: ${{ steps.neon.outputs.name }}
+          parent_branch: ${{ inputs.neon-parent || vars.NEON_CI_PARENT_BRANCH }}
           api_key: ${{ secrets.NEON_API_KEY }}
           database: ${{ inputs.neon-database || secrets.NEON_DATABASE || vars.NEON_DATABASE || 'neondb' }}
           role: ${{ inputs.neon-role || secrets.NEON_ROLE || vars.NEON_ROLE || 'neondb_owner' }}
