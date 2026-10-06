@@ -1,0 +1,55 @@
+# Shared React Doctor scan: security, performance, correctness, accessibility,
+# bundle-size, and architecture findings for React codebases.
+# Docs: https://www.react.doctor/ci
+#
+# Callers:
+#   on:
+#     pull_request:
+#       types: [opened, synchronize, reopened, ready_for_review]
+#     push:
+#       branches: [main]
+#   permissions:
+#     contents: read
+#     pull-requests: write
+#     issues: write
+#     statuses: write
+#   jobs:
+#     react-doctor:
+#       uses: crashoutcompany/.github/.github/workflows/react-doctor.yml@v1
+#
+# On PRs it reports only issues introduced relative to the merge base (sticky
+# summary comment, inline review comments, commit status). On `main` pushes it
+# tracks the health score. Advisory by default; raise `blocking` to gate.
+name: react-doctor
+
+on:
+  workflow_call:
+    inputs:
+      blocking:
+        description: Gate level, "none" (advisory) | "warning" | "error".
+        type: string
+        default: none
+      directory:
+        description: Directory to scan.
+        type: string
+        default: "."
+
+jobs:
+  react-doctor:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      statuses: write
+    steps:
+      # Full history so React Doctor can find the merge base; a shallow clone
+      # makes PR runs report every pre-existing issue in the changed files.
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - uses: millionco/react-doctor@v2
+        with:
+          blocking: ${{ inputs.blocking }}
+          directory: ${{ inputs.directory }}

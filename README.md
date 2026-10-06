@@ -7,9 +7,10 @@ Shared GitHub Actions workflows for the crashoutcompany apps
 |---|---|
 | [`ci.yml`](.github/workflows/ci.yml) | lint + typecheck, unit tests, `vercel build`, Playwright e2e on a Neon branch |
 | [`neon-branches.yml`](.github/workflows/neon-branches.yml) | create/delete a `preview/pr-*` Neon branch per PR |
+| [`react-doctor.yml`](.github/workflows/react-doctor.yml) | advisory React Doctor scan: PR comment, inline review, commit status |
 
-Each app calls them from a short `main.yml` / `neon-branches.yml` with
-`secrets: inherit`. Inputs and the secrets each workflow reads are documented
+Each app calls them from short caller workflows (`main.yml`, `neon-branches.yml`,
+`react-doctor.yml`); the first two use `secrets: inherit`. Inputs and the secrets each workflow reads are documented
 at the top of the workflow file.
 
 ## Releasing
