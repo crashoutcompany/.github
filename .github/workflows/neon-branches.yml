@@ -16,6 +16,11 @@
 # Requires NEON_CI_PARENT_BRANCH (var) or the `neon-parent` input: a
 # seeded/scrubbed branch, never production, because PR code runs against
 # branches copied from it.
+#
+# Preview branches also expire `expires-in-days` days (default 30) after creation,
+# as a safety net for PRs abandoned without being closed. This workflow only runs
+# on open/reopen/close, so a PR left open longer than that loses its preview
+# branch; reopen the PR or raise the input. 0 disables expiry.
 name: neon-branches
 
 on:
@@ -33,6 +38,10 @@ on:
         description: Neon branch that PR branches are created from. Overrides NEON_CI_PARENT_BRANCH (variable). Required.
         type: string
         default: ""
+      expires-in-days:
+        description: Days until a preview branch expires. 0 disables expiry.
+        type: number
+        default: 30
 
 jobs:
   create:
@@ -44,9 +53,13 @@ jobs:
         env:
           PR_NUMBER: ${{ github.event.number }}
           HEAD_REF: ${{ github.head_ref }}
+          EXPIRES_IN_DAYS: ${{ inputs.expires-in-days }}
         run: |
           safe_ref="${HEAD_REF//\//-}"
           printf 'name=preview/pr-%s-%s\n' "$PR_NUMBER" "$safe_ref" >> "$GITHUB_OUTPUT"
+          if [ "${EXPIRES_IN_DAYS:-0}" -gt 0 ]; then
+            printf 'expires_at=%s\n' "$(date -u -d "+${EXPIRES_IN_DAYS} days" +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+          fi
       # Without an explicit parent, Neon copies the project's default branch,
       # which is production data. Fail instead of silently doing that.
       - name: Require Neon CI parent branch
@@ -62,6 +75,7 @@ jobs:
           project_id: ${{ secrets.NEON_PROJECT_ID || vars.NEON_PROJECT_ID }}
           branch_name: ${{ steps.neon.outputs.name }}
           parent_branch: ${{ inputs.neon-parent || vars.NEON_CI_PARENT_BRANCH }}
+          expires_at: ${{ steps.neon.outputs.expires_at }}
           api_key: ${{ secrets.NEON_API_KEY }}
           database: ${{ inputs.neon-database || secrets.NEON_DATABASE || vars.NEON_DATABASE || 'neondb' }}
           role: ${{ inputs.neon-role || secrets.NEON_ROLE || vars.NEON_ROLE || 'neondb_owner' }}
