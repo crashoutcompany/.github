@@ -16,9 +16,23 @@ at the top of the workflow file.
 
 ## Releasing
 
-Apps pin a major tag (`@v1`). After merging a change:
+Callers should pin a full commit SHA with the version as a comment, not the
+moving tag:
+
+```yaml
+uses: crashoutcompany/.github/.github/workflows/ci.yml@<full commit sha> # v1
+```
+
+The workflows run with `secrets: inherit`, so they execute with every app's
+Neon, Vercel and PostHog keys. A force-moved `@v1` would silently change code
+that runs with those secrets; a SHA can't move. Add the `github-actions`
+ecosystem to each app's `dependabot.yml` so SHA bumps arrive as reviewable PRs.
+
+After merging a change, cut an immutable release tag, then move the major tag
+for apps that still follow it:
 
 ```bash
-git tag -f v1 && git push -f origin v1   # non-breaking
-git tag v2 && git push origin v2         # breaking; bump callers one at a time
+git tag v1.2.0 && git push origin v1.2.0      # immutable; Dependabot bumps to this
+git tag -f v1 && git push -f origin v1        # non-breaking, moving major
+git tag v2 && git push origin v2              # breaking; bump callers one at a time
 ```

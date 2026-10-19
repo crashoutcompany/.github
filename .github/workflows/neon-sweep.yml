@@ -22,10 +22,13 @@
 #       permissions:
 #         contents: read
 #         pull-requests: read
-#       uses: crashoutcompany/.github/.github/workflows/neon-sweep.yml@v1
+#       uses: crashoutcompany/.github/.github/workflows/neon-sweep.yml@<full commit sha> # v1
 #       with:
 #         dry-run: ${{ inputs.dry-run || false }}
 #       secrets: inherit
+#
+# Pin the caller to a commit SHA, not the moving `v1` tag: this runs with the
+# app's Neon API key. See the README.
 #
 # Reads NEON_API_KEY and NEON_PROJECT_ID (secret or var) from the calling repository.
 name: neon-sweep
@@ -50,8 +53,10 @@ jobs:
       group: neon-sweep-${{ github.repository }}
       cancel-in-progress: false
     steps:
+      # Exact version: this job holds NEON_API_KEY, so don't float on the latest
+      # release. `branches list --output json` prints a plain array in this version.
       - name: Install neonctl
-        run: npm i -g neonctl@v2
+        run: npm i -g neonctl@2.47.0
       - name: Delete branches of closed PRs and stale CI branches
         env:
           NEON_API_KEY: ${{ secrets.NEON_API_KEY }}
@@ -71,8 +76,10 @@ jobs:
           branches=$(neonctl branches list --project-id "$NEON_PROJECT_ID" --output json)
 
           # One "id<TAB>name<TAB>created_at" line per branch.
+          # Fails (rather than silently sweeping nothing) if the output isn't an array.
           rows=$(node -e '
             const branches = JSON.parse(require("fs").readFileSync(0, "utf8"));
+            if (!Array.isArray(branches)) throw new Error("neonctl branches list did not return an array");
             for (const b of branches) console.log([b.id, b.name, b.created_at].join("\t"));
           ' <<<"$branches")
 
@@ -95,7 +102,11 @@ jobs:
                 reason="PR #$number is $state"
                 ;;
               ci/e2e-*)
-                age=$((now - $(date -d "$created" +%s)))
+                ts=$(date -d "$created" +%s 2>/dev/null) || {
+                  echo "::warning::Skipping $name: bad created_at '$created'"
+                  continue
+                }
+                age=$((now - ts))
                 [ "$age" -ge $((EPHEMERAL_MAX_AGE_HOURS * 3600)) ] || continue
                 reason="CI throwaway branch is $((age / 3600))h old"
                 ;;
