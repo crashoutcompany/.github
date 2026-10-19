@@ -257,7 +257,7 @@ jobs:
           GIT_SHA: ${{ github.sha }}
         run: |
           if [ "$EVENT_NAME" = "pull_request" ]; then
-            safe_ref="${HEAD_REF//\//-}"
+            safe_ref="$(printf '%s' "$HEAD_REF" | tr -c 'A-Za-z0-9._-' '-')"
             printf 'name=preview/pr-%s-%s\n' "$PR_NUMBER" "$safe_ref" >> "$GITHUB_OUTPUT"
             printf 'ephemeral=false\n' >> "$GITHUB_OUTPUT"
           else

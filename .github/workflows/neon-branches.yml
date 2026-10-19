@@ -5,11 +5,25 @@
 # Callers:
 #   on:
 #     pull_request:
-#       types: [opened, reopened, closed]
+#       types: [opened, reopened]
+#     pull_request_target:
+#       types: [closed]
 #   jobs:
 #     neon:
 #       uses: crashoutcompany/.github/.github/workflows/neon-branches.yml@v1
 #       secrets: inherit
+#
+# Close runs on pull_request_target because GitHub skips `pull_request`
+# workflows (closed included) for PRs with merge conflicts, so a PR closed while
+# conflicting would keep its Neon branch. That is safe here: the workflow runs
+# from the base branch and the `delete` job only calls the Neon API. Never add a
+# checkout of the PR head or run PR code in this workflow.
+#
+# The branch name comes from the PR's head ref, which neondatabase's actions
+# paste into shell scripts, so it is reduced to [A-Za-z0-9._-] (`/` and anything
+# else becomes `-`). Keep ci.yml's e2e job in sync with this.
+#
+# Missed deletes (and branches recreated after one) are caught by neon-sweep.yml.
 #
 # Reads NEON_API_KEY and NEON_PROJECT_ID (secret or var), plus optional
 # NEON_DATABASE / NEON_ROLE (secret or var) from the calling repository.
@@ -55,7 +69,7 @@ jobs:
           HEAD_REF: ${{ github.head_ref }}
           EXPIRES_IN_DAYS: ${{ inputs.expires-in-days }}
         run: |
-          safe_ref="${HEAD_REF//\//-}"
+          safe_ref="$(printf '%s' "$HEAD_REF" | tr -c 'A-Za-z0-9._-' '-')"
           printf 'name=preview/pr-%s-%s\n' "$PR_NUMBER" "$safe_ref" >> "$GITHUB_OUTPUT"
           if [ "${EXPIRES_IN_DAYS:-0}" -gt 0 ]; then
             printf 'expires_at=%s\n' "$(date -u -d "+${EXPIRES_IN_DAYS} days" +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
@@ -90,7 +104,7 @@ jobs:
           PR_NUMBER: ${{ github.event.number }}
           HEAD_REF: ${{ github.head_ref }}
         run: |
-          safe_ref="${HEAD_REF//\//-}"
+          safe_ref="$(printf '%s' "$HEAD_REF" | tr -c 'A-Za-z0-9._-' '-')"
           printf 'name=preview/pr-%s-%s\n' "$PR_NUMBER" "$safe_ref" >> "$GITHUB_OUTPUT"
       - uses: neondatabase/delete-branch-action@v3
         with:
