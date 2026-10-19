@@ -1,6 +1,6 @@
 # Shared Neon preview branches: one `preview/pr-<number>-<head-ref>` branch
 # per same-repo PR, created on open/reopen and deleted on close. ci.yml's e2e
-# job reuses the same branch name.
+# job does not use it: PR e2e runs get their own throwaway `ci/e2e-*` branch.
 #
 # Callers:
 #   on:
@@ -10,8 +10,12 @@
 #       types: [closed]
 #   jobs:
 #     neon:
-#       uses: crashoutcompany/.github/.github/workflows/neon-branches.yml@v1
+#       uses: crashoutcompany/.github/.github/workflows/neon-branches.yml@<full commit sha> # v1
 #       secrets: inherit
+#
+# Pin callers to a commit SHA, not the moving `v1` tag: with `secrets: inherit`
+# this code runs with the app's Neon API key, so a retagged `v1` would change it
+# silently. See the README.
 #
 # Close runs on pull_request_target because GitHub skips `pull_request`
 # workflows (closed included) for PRs with merge conflicts, so a PR closed while
@@ -21,7 +25,7 @@
 #
 # The branch name comes from the PR's head ref, which neondatabase's actions
 # paste into shell scripts, so it is reduced to [A-Za-z0-9._-] (`/` and anything
-# else becomes `-`). Keep ci.yml's e2e job in sync with this.
+# else becomes `-`).
 #
 # Missed deletes (and branches recreated after one) are caught by neon-sweep.yml.
 #
@@ -95,7 +99,9 @@ jobs:
           role: ${{ inputs.neon-role || secrets.NEON_ROLE || vars.NEON_ROLE || 'neondb_owner' }}
 
   delete:
-    if: github.event.action == 'closed' && github.event.pull_request.head.repo.full_name == github.repository
+    # Dependabot-triggered events get Dependabot's secrets, not the repository's,
+    # so there is no Neon key to delete with.
+    if: github.event.action == 'closed' && github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]'
     runs-on: ubuntu-latest
     steps:
       - name: Resolve Neon branch
@@ -106,8 +112,23 @@ jobs:
         run: |
           safe_ref="$(printf '%s' "$HEAD_REF" | tr -c 'A-Za-z0-9._-' '-')"
           printf 'name=preview/pr-%s-%s\n' "$PR_NUMBER" "$safe_ref" >> "$GITHUB_OUTPUT"
-      - uses: neondatabase/delete-branch-action@v3
-        with:
-          project_id: ${{ secrets.NEON_PROJECT_ID || vars.NEON_PROJECT_ID }}
-          branch: ${{ steps.neon.outputs.name }}
-          api_key: ${{ secrets.NEON_API_KEY }}
+      # neondatabase/delete-branch-action fails when the branch doesn't exist,
+      # which is the normal case for Dependabot PRs (create skips them) and for
+      # PRs whose branch already expired. The name also reaches neonctl through
+      # the environment, not by being pasted into a script.
+      - name: Install neonctl
+        run: npm i -g neonctl@2.47.0
+      - name: Delete Neon branch if it exists
+        env:
+          NEON_API_KEY: ${{ secrets.NEON_API_KEY }}
+          NEON_PROJECT_ID: ${{ secrets.NEON_PROJECT_ID || vars.NEON_PROJECT_ID }}
+          BRANCH: ${{ steps.neon.outputs.name }}
+        run: |
+          if out=$(neonctl branches delete "$BRANCH" --project-id "$NEON_PROJECT_ID" 2>&1); then
+            echo "$out"
+          elif grep -qi 'not found' <<<"$out"; then
+            echo "No Neon branch $BRANCH; nothing to delete."
+          else
+            echo "$out" >&2
+            exit 1
+          fi
