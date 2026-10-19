@@ -1,0 +1,118 @@
+# Shared Neon sweeper: deletes Neon branches that nothing else will clean up.
+#   - preview/pr-<N>-*  whose PR is closed, merged or gone. neon-branches.yml
+#     deletes these on close, but an event can still be missed and a late CI run
+#     can recreate a branch after its delete.
+#   - ci/e2e-*  throwaway branches from pushes older than `ephemeral-max-age-hours`,
+#     i.e. their job was killed before ci.yml's cleanup step.
+# Branches of open PRs are never touched, and neither is anything else (the
+# default branch, `development`, hand-made branches). A GitHub API error skips
+# the branch instead of treating its PR as gone.
+#
+# Caller (the job needs `pull-requests: read` for the PR lookups):
+#   on:
+#     schedule:
+#       - cron: "17 6 * * *"
+#     workflow_dispatch:
+#       inputs:
+#         dry-run: { type: boolean, default: false }
+#   permissions:
+#     contents: read
+#   jobs:
+#     sweep:
+#       permissions:
+#         contents: read
+#         pull-requests: read
+#       uses: crashoutcompany/.github/.github/workflows/neon-sweep.yml@v1
+#       with:
+#         dry-run: ${{ inputs.dry-run || false }}
+#       secrets: inherit
+#
+# Reads NEON_API_KEY and NEON_PROJECT_ID (secret or var) from the calling repository.
+name: neon-sweep
+
+on:
+  workflow_call:
+    inputs:
+      dry-run:
+        description: Only print the branches that would be deleted.
+        type: boolean
+        default: false
+      ephemeral-max-age-hours:
+        description: Age after which a ci/e2e-* branch counts as leaked. Keep it above the e2e job timeout.
+        type: number
+        default: 6
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: neon-sweep-${{ github.repository }}
+      cancel-in-progress: false
+    steps:
+      - name: Install neonctl
+        run: npm i -g neonctl@v2
+      - name: Delete branches of closed PRs and stale CI branches
+        env:
+          NEON_API_KEY: ${{ secrets.NEON_API_KEY }}
+          NEON_PROJECT_ID: ${{ secrets.NEON_PROJECT_ID || vars.NEON_PROJECT_ID }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          DRY_RUN: ${{ inputs.dry-run && 'true' || 'false' }}
+          EPHEMERAL_MAX_AGE_HOURS: ${{ inputs.ephemeral-max-age-hours }}
+        run: |
+          set -euo pipefail
+          : "${NEON_PROJECT_ID:?NEON_PROJECT_ID is required}"
+
+          now=$(date +%s)
+          failed=0
+          deleted=0
+
+          branches=$(neonctl branches list --project-id "$NEON_PROJECT_ID" --output json)
+
+          # One "id<TAB>name<TAB>created_at" line per branch.
+          rows=$(node -e '
+            const branches = JSON.parse(require("fs").readFileSync(0, "utf8"));
+            for (const b of branches) console.log([b.id, b.name, b.created_at].join("\t"));
+          ' <<<"$branches")
+
+          while IFS=$'\t' read -r id name created; do
+            [ -n "$id" ] || continue
+            case "$name" in
+              preview/pr-*)
+                number="${name#preview/pr-}"
+                number="${number%%-*}"
+                [[ "$number" =~ ^[0-9]+$ ]] || continue
+                if state=$(gh api "repos/$GH_REPO/pulls/$number" --jq .state 2>&1); then
+                  :
+                elif grep -q 'HTTP 404' <<<"$state"; then
+                  state=missing
+                else
+                  echo "::warning::Skipping $name: could not read PR #$number: $state"
+                  continue
+                fi
+                [ "$state" = open ] && continue
+                reason="PR #$number is $state"
+                ;;
+              ci/e2e-*)
+                age=$((now - $(date -d "$created" +%s)))
+                [ "$age" -ge $((EPHEMERAL_MAX_AGE_HOURS * 3600)) ] || continue
+                reason="CI throwaway branch is $((age / 3600))h old"
+                ;;
+              *) continue ;;
+            esac
+
+            if [ "$DRY_RUN" = true ]; then
+              echo "would delete $name ($id): $reason"
+              deleted=$((deleted + 1))
+            elif neonctl branches delete "$id" --project-id "$NEON_PROJECT_ID" >/dev/null; then
+              echo "deleted $name ($id): $reason"
+              deleted=$((deleted + 1))
+            else
+              echo "::warning::Failed to delete $name ($id): $reason"
+              failed=$((failed + 1))
+            fi
+          done <<<"$rows"
+
+          echo "Done: $deleted branch(es) $([ "$DRY_RUN" = true ] && echo "would be ")deleted, $failed failed."
+          [ "$failed" -eq 0 ]
