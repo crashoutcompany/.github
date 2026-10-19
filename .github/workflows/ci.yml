@@ -246,24 +246,26 @@ jobs:
             printf '%s<<%s\n%s\n%s\n' "$name" "$delim" "$value" "$delim" >> "$GITHUB_ENV"
           done
 
-      # PRs share the long-lived preview/pr-* branch managed by
-      # neon-branches.yml; pushes get a throwaway branch deleted below.
+      # Every e2e run gets its own throwaway branch, deleted below even when the
+      # tests fail or the run is cancelled. PRs used to reuse the long-lived
+      # preview/pr-* branch from neon-branches.yml, so a run finishing after the
+      # merge could recreate the branch that job had just deleted. Anything a
+      # killed run leaves behind is swept by neon-sweep.yml (ci/e2e-* older than 6h).
       - name: Resolve Neon branch
         id: neon
         env:
           EVENT_NAME: ${{ github.event_name }}
           PR_NUMBER: ${{ github.event.number }}
-          HEAD_REF: ${{ github.head_ref }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
           GIT_SHA: ${{ github.sha }}
         run: |
           if [ "$EVENT_NAME" = "pull_request" ]; then
-            safe_ref="$(printf '%s' "$HEAD_REF" | tr -c 'A-Za-z0-9._-' '-')"
-            printf 'name=preview/pr-%s-%s\n' "$PR_NUMBER" "$safe_ref" >> "$GITHUB_OUTPUT"
-            printf 'ephemeral=false\n' >> "$GITHUB_OUTPUT"
+            printf 'name=ci/e2e-pr%s-%s-%s\n' "$PR_NUMBER" "$RUN_ID" "$RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
           else
             printf 'name=ci/e2e-%s\n' "$GIT_SHA" >> "$GITHUB_OUTPUT"
-            printf 'ephemeral=true\n' >> "$GITHUB_OUTPUT"
           fi
+          printf 'ephemeral=true\n' >> "$GITHUB_OUTPUT"
 
       # Without an explicit parent, Neon copies the project's default branch,
       # which is production data. Fail instead of silently doing that.
@@ -276,7 +278,7 @@ jobs:
             exit 1
           fi
 
-      - name: Create or reuse Neon branch
+      - name: Create Neon branch
         id: database
         uses: neondatabase/create-branch-action@v6
         with:
