@@ -61,6 +61,10 @@ on:
         description: Run `prisma db push` + `prisma generate --sql` on the Neon branch before e2e.
         type: boolean
         default: false
+      prisma-migrate-neon:
+        description: Run `prisma migrate deploy` on the e2e job's ephemeral Neon branch (direct URL) before e2e, so migrations added in the PR exist on a branch copied from an older parent. Opt-in; never touches the parent or production branch.
+        type: boolean
+        default: false
       neon-database:
         description: Neon database name. Overrides NEON_DATABASE; empty uses NEON_DATABASE (secret or variable), then neondb.
         type: string
@@ -295,6 +299,18 @@ jobs:
           DATABASE_URL: ${{ steps.database.outputs.db_url_pooled }}
           DIRECT_URL: ${{ steps.database.outputs.db_url }}
         run: pnpm install --frozen-lockfile
+
+      # Applies the PR's migration files to this run's throwaway branch only: the
+      # URLs come from the create-branch step above, never from secrets. The
+      # direct URL is used for both variables because migrate deploy takes
+      # advisory locks, which don't work through the pooler, and some
+      # prisma.config.ts files read only DATABASE_URL.
+      - name: Apply Prisma migrations to Neon branch
+        if: inputs.prisma-migrate-neon
+        env:
+          DATABASE_URL: ${{ steps.database.outputs.db_url }}
+          DIRECT_URL: ${{ steps.database.outputs.db_url }}
+        run: pnpm exec prisma migrate deploy
 
       - name: Sync Prisma schema to Neon branch
         if: inputs.sync-prisma-neon
