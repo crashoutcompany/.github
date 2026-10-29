@@ -32,8 +32,22 @@
 # Reads NEON_API_KEY and NEON_PROJECT_ID (secret or var), plus optional
 # NEON_DATABASE / NEON_ROLE (secret or var) from the calling repository.
 # Requires NEON_CI_PARENT_BRANCH (var) or the `neon-parent` input: a
-# seeded/scrubbed branch, never production, because PR code runs against
-# branches copied from it.
+# seeded/scrubbed branch such as `development`, never main/production, because
+# PR code runs against branches copied from it.
+#
+# Vercel (optional): when VERCEL_TOKEN (secret) is set, `create` also upserts the
+# new branch's connection strings as Vercel project env vars scoped to the
+# preview target and the PR's head ref (`gitBranch`), so that PR's preview
+# deploys use its own Neon branch instead of the shared DATABASE_URL. `delete`
+# removes them again. Without VERCEL_TOKEN both steps log a notice and skip.
+# Needs VERCEL_PROJECT_ID (secret or var) and, for a team project,
+# VERCEL_TEAM_ID (secret or var). The pooled URL goes to the key named by
+# `vercel-database-url-key` (default DATABASE_URL), the direct URL to
+# `vercel-direct-url-key` (default DIRECT_URL; empty disables it). The token
+# needs write access to the project's env vars.
+# Race: Vercel starts the first preview build of a newly opened PR in parallel
+# with this job, so that build may run before the env vars exist and read the
+# fallback value. Redeploy the preview once (or push again) after this job passes.
 #
 # Preview branches also expire `expires-in-days` days (default 30) after creation,
 # as a safety net for PRs abandoned without being closed. This workflow only runs
@@ -60,6 +74,14 @@ on:
         description: Days until a preview branch expires. 0 disables expiry.
         type: number
         default: 30
+      vercel-database-url-key:
+        description: Vercel env var that receives the pooled Neon URL (only used when VERCEL_TOKEN is set).
+        type: string
+        default: DATABASE_URL
+      vercel-direct-url-key:
+        description: Vercel env var that receives the direct (unpooled) Neon URL. Empty string disables it.
+        type: string
+        default: DIRECT_URL
 
 jobs:
   create:
@@ -88,7 +110,9 @@ jobs:
             echo "::error::Set the NEON_CI_PARENT_BRANCH repository variable (or the neon-parent input) to a seeded/scrubbed Neon branch. PR branches must not be copied from production."
             exit 1
           fi
-      - uses: neondatabase/create-branch-action@v6
+      - name: Create Neon branch
+        id: branch
+        uses: neondatabase/create-branch-action@v6
         with:
           project_id: ${{ secrets.NEON_PROJECT_ID || vars.NEON_PROJECT_ID }}
           branch_name: ${{ steps.neon.outputs.name }}
@@ -97,6 +121,69 @@ jobs:
           api_key: ${{ secrets.NEON_API_KEY }}
           database: ${{ inputs.neon-database || secrets.NEON_DATABASE || vars.NEON_DATABASE || 'neondb' }}
           role: ${{ inputs.neon-role || secrets.NEON_ROLE || vars.NEON_ROLE || 'neondb_owner' }}
+      # Everything reaches the script through env, never through ${{ }} in the
+      # script body: the head ref is attacker-controlled and the URLs are secrets.
+      # The Vercel scope is the raw head ref (what Vercel matches deployments
+      # against), not the sanitized Neon branch name.
+      - name: Publish Neon URLs to Vercel preview env
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID || vars.VERCEL_PROJECT_ID }}
+          VERCEL_TEAM_ID: ${{ secrets.VERCEL_TEAM_ID || vars.VERCEL_TEAM_ID }}
+          GIT_BRANCH: ${{ github.head_ref }}
+          DB_URL_KEY: ${{ inputs.vercel-database-url-key }}
+          DIRECT_URL_KEY: ${{ inputs.vercel-direct-url-key }}
+          POOLED_URL: ${{ steps.branch.outputs.db_url_pooled }}
+          DIRECT_URL: ${{ steps.branch.outputs.db_url }}
+        run: |
+          if [ -z "$VERCEL_TOKEN" ]; then
+            echo "::notice::VERCEL_TOKEN is not set; skipping Vercel preview env update."
+            exit 0
+          fi
+          if [ -z "$VERCEL_PROJECT_ID" ]; then
+            echo "::error::VERCEL_TOKEN is set but VERCEL_PROJECT_ID (secret or variable) is not."
+            exit 1
+          fi
+          [ -n "$POOLED_URL" ] && echo "::add-mask::$POOLED_URL"
+          [ -n "$DIRECT_URL" ] && echo "::add-mask::$DIRECT_URL"
+
+          api="https://api.vercel.com/v10/projects/${VERCEL_PROJECT_ID}/env?upsert=true"
+          [ -n "$VERCEL_TEAM_ID" ] && api="${api}&teamId=${VERCEL_TEAM_ID}"
+
+          # $1 = Vercel env var name, $2 = its value. The body can echo request
+          # details, so only the HTTP status and Vercel's error code are logged.
+          upsert() {
+            local key="$1" value="$2" body code
+            body="$(mktemp)"
+            code="$(KEY="$key" VALUE="$value" jq -n '{
+                key: $ENV.KEY, value: $ENV.VALUE, type: "encrypted",
+                target: ["preview"], gitBranch: $ENV.GIT_BRANCH
+              }' | curl -sS -o "$body" -w '%{http_code}' -X POST "$api" \
+                -H "Authorization: Bearer $VERCEL_TOKEN" \
+                -H 'Content-Type: application/json' --data-binary @-)" || code=000
+            case "$code" in
+              2??) echo "Set $key on Vercel (preview, branch $GIT_BRANCH)." ;;
+              *)
+                echo "::error::Vercel rejected $key: HTTP $code ($(jq -r '.error.code // "no error code"' "$body" 2>/dev/null))"
+                rm -f "$body"
+                exit 1
+                ;;
+            esac
+            rm -f "$body"
+          }
+
+          if [ -z "$POOLED_URL" ]; then
+            echo "::error::create-branch-action returned no pooled URL (db_url_pooled)."
+            exit 1
+          fi
+          upsert "$DB_URL_KEY" "$POOLED_URL"
+          if [ -n "$DIRECT_URL_KEY" ]; then
+            if [ -z "$DIRECT_URL" ]; then
+              echo "::error::create-branch-action returned no direct URL (db_url)."
+              exit 1
+            fi
+            upsert "$DIRECT_URL_KEY" "$DIRECT_URL"
+          fi
 
   delete:
     # Dependabot-triggered events get Dependabot's secrets, not the repository's,
@@ -132,3 +219,67 @@ jobs:
             echo "$out" >&2
             exit 1
           fi
+      # Removes only the two keys this workflow manages (see the inputs), scoped
+      # to this head ref and the preview target, so branch-scoped variables set by
+      # hand survive. As above, nothing from the PR is interpolated into the script.
+      - name: Delete Vercel preview env vars
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID || vars.VERCEL_PROJECT_ID }}
+          VERCEL_TEAM_ID: ${{ secrets.VERCEL_TEAM_ID || vars.VERCEL_TEAM_ID }}
+          GIT_BRANCH: ${{ github.head_ref }}
+          DB_URL_KEY: ${{ inputs.vercel-database-url-key }}
+          DIRECT_URL_KEY: ${{ inputs.vercel-direct-url-key }}
+        run: |
+          if [ -z "$VERCEL_TOKEN" ]; then
+            echo "::notice::VERCEL_TOKEN is not set; skipping Vercel preview env cleanup."
+            exit 0
+          fi
+          if [ -z "$VERCEL_PROJECT_ID" ]; then
+            echo "::error::VERCEL_TOKEN is set but VERCEL_PROJECT_ID (secret or variable) is not."
+            exit 1
+          fi
+          team=()
+          [ -n "$VERCEL_TEAM_ID" ] && team=(--data-urlencode "teamId=$VERCEL_TEAM_ID")
+          base="https://api.vercel.com"
+          auth="Authorization: Bearer $VERCEL_TOKEN"
+          list="$(mktemp)"
+
+          code="$(curl -sS -G -o "$list" -w '%{http_code}' -H "$auth" "${team[@]}" \
+            --data-urlencode "gitBranch=$GIT_BRANCH" \
+            "$base/v10/projects/${VERCEL_PROJECT_ID}/env")" || code=000
+          case "$code" in
+            2??) ;;
+            404) echo "Vercel project not found; nothing to delete."; exit 0 ;;
+            *)
+              echo "::error::Listing Vercel env vars failed: HTTP $code"
+              exit 1
+              ;;
+          esac
+
+          # Filter again client-side in case the API ignores the gitBranch query.
+          ids="$(jq -r '
+            [$ENV.DB_URL_KEY, $ENV.DIRECT_URL_KEY] as $keys
+            | .envs[]?
+            | select(.gitBranch == $ENV.GIT_BRANCH
+                and ((.target // []) | if type == "array" then . else [.] end | index("preview"))
+                and (.key as $k | $keys | index($k)))
+            | "\(.id) \(.key)"' "$list")"
+          rm -f "$list"
+          if [ -z "$ids" ]; then
+            echo "No Vercel preview env vars for branch $GIT_BRANCH."
+            exit 0
+          fi
+
+          while read -r id key; do
+            code="$(curl -sS -o /dev/null -w '%{http_code}' -X DELETE -H "$auth" "${team[@]}" -G \
+              "$base/v9/projects/${VERCEL_PROJECT_ID}/env/${id}")" || code=000
+            case "$code" in
+              2??) echo "Deleted $key from Vercel (preview, branch $GIT_BRANCH)." ;;
+              404) echo "$key already gone from Vercel." ;;
+              *)
+                echo "::error::Deleting $key from Vercel failed: HTTP $code"
+                exit 1
+                ;;
+            esac
+          done <<<"$ids"
