@@ -2,7 +2,8 @@
 # per same-repo PR, created on open/reopen and deleted on close. ci.yml's e2e
 # job does not use it: PR e2e runs get their own throwaway `ci/e2e-*` branch.
 #
-# Callers:
+# Callers (add `synchronize` when using `prisma-migrate`, so later pushes'
+# migrations reach the branch too; creating an existing branch is a no-op):
 #   on:
 #     pull_request:
 #       types: [opened, reopened]
@@ -21,7 +22,8 @@
 # workflows (closed included) for PRs with merge conflicts, so a PR closed while
 # conflicting would keep its Neon branch. That is safe here: the workflow runs
 # from the base branch and the `delete` job only calls the Neon API. Never add a
-# checkout of the PR head or run PR code in this workflow.
+# checkout of the PR head or run PR code in the `delete` job, or anywhere on
+# pull_request_target. The one exception is `prisma-migrate` below.
 #
 # The branch name comes from the PR's head ref, which neondatabase's actions
 # paste into shell scripts, so it is reduced to [A-Za-z0-9._-] (`/` and anything
@@ -29,11 +31,41 @@
 #
 # Missed deletes (and branches recreated after one) are caught by neon-sweep.yml.
 #
+# Migrations (opt-in, `prisma-migrate: true`): after everything else, `create`
+# checks out the PR, installs it and runs `prisma migrate deploy` against the
+# branch's direct URL, so the preview deploy sees the PR's schema. This runs PR
+# code, so it only happens on `pull_request` for same-repo, non-Dependabot PRs
+# (the same trust as ci.yml's e2e job), never on pull_request_target, and it
+# must stay the last step of the job: nothing that holds NEON_API_KEY or
+# VERCEL_TOKEN may run after PR code on the same runner. The first preview build
+# of a PR can still finish before the migration does; redeploy (or push) once.
+#
 # Reads NEON_API_KEY and NEON_PROJECT_ID (secret or var), plus optional
 # NEON_DATABASE / NEON_ROLE (secret or var) from the calling repository.
 # Requires NEON_CI_PARENT_BRANCH (var) or the `neon-parent` input: a
-# seeded/scrubbed branch, never production, because PR code runs against
-# branches copied from it.
+# seeded/scrubbed branch such as `development`, never main/production, because
+# PR code runs against branches copied from it.
+#
+# Vercel (opt-in, `vercel-preview-env: true`): `create` also upserts the new
+# branch's connection strings as Vercel project env vars scoped to the preview
+# target and the PR's head ref (`gitBranch`), so that PR's preview deploys use
+# its own Neon branch instead of the shared Preview DATABASE_URL. `delete`
+# removes them again, and neon-sweep.yml removes any whose PR or Neon branch is
+# gone. It is opt-in because every caller already has VERCEL_TOKEN for ci.yml.
+# Needs VERCEL_TOKEN (secret, write access to the project's env vars),
+# VERCEL_PROJECT_ID and, for a team project, VERCEL_TEAM_ID or VERCEL_ORG_ID
+# (secret or var; a `team_` ID is required for team projects). The pooled URL
+# goes to the key named by `vercel-database-url-key` (default DATABASE_URL),
+# the direct URL to `vercel-direct-url-key` (default DIRECT_URL; empty disables
+# it). The vars carry the comment "managed by crashoutcompany/.github
+# neon-branches", which is how the sweep tells them from hand-made ones.
+# With this on, the parent must not be the Neon project's default branch: the
+# job fails instead of handing preview deploys a copy of production.
+# Race: Vercel starts the first preview build of a newly opened PR in parallel
+# with this job, so that build may run before the env vars exist and read the
+# shared Preview value. Point the shared Preview DATABASE_URL at a scrubbed
+# branch so that build is harmless, and redeploy (or push) for the PR's own
+# branch. PRs opened before this was turned on get their vars on reopen.
 #
 # Preview branches also expire `expires-in-days` days (default 30) after creation,
 # as a safety net for PRs abandoned without being closed. This workflow only runs
@@ -56,15 +88,44 @@ on:
         description: Neon branch that PR branches are created from. Overrides NEON_CI_PARENT_BRANCH (variable). Required.
         type: string
         default: ""
+      prisma-migrate:
+        description: Check out the PR and run `prisma migrate deploy` on its Neon branch (direct URL). Runs PR code; pull_request events only.
+        type: boolean
+        default: false
+      node-version:
+        description: Node.js version for prisma-migrate.
+        type: string
+        default: "24"
+      pnpm-version:
+        description: pnpm version for prisma-migrate.
+        type: string
+        default: "10.1.0"
       expires-in-days:
         description: Days until a preview branch expires. 0 disables expiry.
         type: number
         default: 30
+      vercel-preview-env:
+        description: Publish the PR branch's Neon URLs as Vercel preview env vars for the PR's head ref, and remove them on close.
+        type: boolean
+        default: false
+      vercel-database-url-key:
+        description: Vercel env var that receives the pooled Neon URL (only used with vercel-preview-env).
+        type: string
+        default: DATABASE_URL
+      vercel-direct-url-key:
+        description: Vercel env var that receives the direct (unpooled) Neon URL. Empty string disables it.
+        type: string
+        default: DIRECT_URL
 
 jobs:
   create:
     if: github.event.action != 'closed' && github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]'
     runs-on: ubuntu-latest
+    # One run per PR at a time, so rapid pushes migrate in order and a close
+    # waits for a running create.
+    concurrency:
+      group: neon-branches-${{ github.repository }}-${{ github.event.number }}
+      cancel-in-progress: false
     steps:
       - name: Resolve Neon branch
         id: neon
@@ -88,7 +149,43 @@ jobs:
             echo "::error::Set the NEON_CI_PARENT_BRANCH repository variable (or the neon-parent input) to a seeded/scrubbed Neon branch. PR branches must not be copied from production."
             exit 1
           fi
-      - uses: neondatabase/create-branch-action@v6
+      # Preview deploys serve real traffic (and may allow test login), so with
+      # vercel-preview-env they must never get a copy of production. The
+      # project's default branch is production; refuse it by name or ID.
+      - name: Require pull_request for prisma-migrate
+        if: inputs.prisma-migrate && github.event_name != 'pull_request'
+        run: |
+          echo "::error::prisma-migrate runs PR code, so it only runs on pull_request events, not $GITHUB_EVENT_NAME."
+          exit 1
+      - name: Refuse the default branch as a Vercel preview parent
+        if: inputs.vercel-preview-env
+        env:
+          NEON_API_KEY: ${{ secrets.NEON_API_KEY }}
+          NEON_PROJECT_ID: ${{ secrets.NEON_PROJECT_ID || vars.NEON_PROJECT_ID }}
+          NEON_PARENT: ${{ inputs.neon-parent || vars.NEON_CI_PARENT_BRANCH }}
+        run: |
+          body="$(mktemp)"
+          code="$(curl -sS -o "$body" -w '%{http_code}' \
+            -H "Authorization: Bearer $NEON_API_KEY" -H 'Accept: application/json' \
+            "https://console.neon.tech/api/v2/projects/${NEON_PROJECT_ID}/branches")" || code=000
+          if [ "${code:0:1}" != 2 ]; then
+            echo "::error::Listing Neon branches failed: HTTP $code"
+            exit 1
+          fi
+          default="$(jq -r '.branches[] | select(.default == true) | "\(.id) \(.name)"' "$body")"
+          rm -f "$body"
+          read -r default_id default_name <<<"$default"
+          if [ -z "$default_id" ]; then
+            echo "::error::Could not find the Neon project's default branch."
+            exit 1
+          fi
+          if [ "$NEON_PARENT" = "$default_id" ] || [ "$NEON_PARENT" = "$default_name" ]; then
+            echo "::error::NEON_CI_PARENT_BRANCH ($NEON_PARENT) is the Neon project's default (production) branch. Point it at a scrubbed branch before turning on vercel-preview-env."
+            exit 1
+          fi
+      - name: Create Neon branch
+        id: branch
+        uses: neondatabase/create-branch-action@v6
         with:
           project_id: ${{ secrets.NEON_PROJECT_ID || vars.NEON_PROJECT_ID }}
           branch_name: ${{ steps.neon.outputs.name }}
@@ -97,12 +194,115 @@ jobs:
           api_key: ${{ secrets.NEON_API_KEY }}
           database: ${{ inputs.neon-database || secrets.NEON_DATABASE || vars.NEON_DATABASE || 'neondb' }}
           role: ${{ inputs.neon-role || secrets.NEON_ROLE || vars.NEON_ROLE || 'neondb_owner' }}
+      # Everything reaches the script through env, never through ${{ }} in the
+      # script body: the head ref is attacker-controlled and the URLs are secrets.
+      # The Vercel scope is the raw head ref (what Vercel matches deployments
+      # against), not the sanitized Neon branch name.
+      - name: Publish Neon URLs to Vercel preview env
+        if: inputs.vercel-preview-env
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID || vars.VERCEL_PROJECT_ID }}
+          VERCEL_TEAM_ID: ${{ secrets.VERCEL_TEAM_ID || vars.VERCEL_TEAM_ID }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID || vars.VERCEL_ORG_ID }}
+          GIT_BRANCH: ${{ github.head_ref }}
+          DB_URL_KEY: ${{ inputs.vercel-database-url-key }}
+          DIRECT_URL_KEY: ${{ inputs.vercel-direct-url-key }}
+          POOLED_URL: ${{ steps.branch.outputs.db_url_pooled }}
+          DIRECT_URL: ${{ steps.branch.outputs.db_url }}
+        run: |
+          if [ -z "$VERCEL_TOKEN" ] || [ -z "$VERCEL_PROJECT_ID" ]; then
+            echo "::error::vercel-preview-env needs VERCEL_TOKEN (secret) and VERCEL_PROJECT_ID (secret or variable)."
+            exit 1
+          fi
+          # ci.yml's VERCEL_ORG_ID is the team ID for team projects (team_...)
+          # and a user ID otherwise, which the API must not get as teamId.
+          if [ -z "$VERCEL_TEAM_ID" ] && [[ "$VERCEL_ORG_ID" == team_* ]]; then
+            VERCEL_TEAM_ID="$VERCEL_ORG_ID"
+          fi
+          [ -n "$POOLED_URL" ] && echo "::add-mask::$POOLED_URL"
+          [ -n "$DIRECT_URL" ] && echo "::add-mask::$DIRECT_URL"
+
+          api="https://api.vercel.com/v10/projects/${VERCEL_PROJECT_ID}/env?upsert=true"
+          [ -n "$VERCEL_TEAM_ID" ] && api="${api}&teamId=${VERCEL_TEAM_ID}"
+
+          # $1 = Vercel env var name, $2 = its value. The body can echo request
+          # details, so only the HTTP status and Vercel's error code are logged.
+          upsert() {
+            local key="$1" value="$2" body code
+            body="$(mktemp)"
+            code="$(KEY="$key" VALUE="$value" jq -n '{
+                key: $ENV.KEY, value: $ENV.VALUE, type: "encrypted",
+                target: ["preview"], gitBranch: $ENV.GIT_BRANCH,
+                comment: "managed by crashoutcompany/.github neon-branches"
+              }' | curl -sS -o "$body" -w '%{http_code}' -X POST "$api" \
+                -H "Authorization: Bearer $VERCEL_TOKEN" \
+                -H 'Content-Type: application/json' --data-binary @-)" || code=000
+            case "$code" in
+              2??) echo "Set $key on Vercel (preview, branch $GIT_BRANCH)." ;;
+              *)
+                echo "::error::Vercel rejected $key: HTTP $code ($(jq -r '.error.code // "no error code"' "$body" 2>/dev/null))"
+                rm -f "$body"
+                exit 1
+                ;;
+            esac
+            rm -f "$body"
+          }
+
+          if [ -z "$POOLED_URL" ]; then
+            echo "::error::create-branch-action returned no pooled URL (db_url_pooled)."
+            exit 1
+          fi
+          upsert "$DB_URL_KEY" "$POOLED_URL"
+          if [ -n "$DIRECT_URL_KEY" ]; then
+            if [ -z "$DIRECT_URL" ]; then
+              echo "::error::create-branch-action returned no direct URL (db_url)."
+              exit 1
+            fi
+            upsert "$DIRECT_URL_KEY" "$DIRECT_URL"
+          fi
+      # PR code from here on. Keep these steps last: see the header.
+      # Credentials are not persisted, and only this branch's URLs (never
+      # repository secrets) are in the environment. migrate deploy takes
+      # advisory locks, which don't work through the pooler, so both variables
+      # get the direct URL, as in ci.yml.
+      - name: Check out PR
+        if: inputs.prisma-migrate
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Set up pnpm
+        if: inputs.prisma-migrate
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ inputs.pnpm-version }}
+      - name: Set up Node.js
+        if: inputs.prisma-migrate
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: pnpm
+      - name: Install dependencies
+        if: inputs.prisma-migrate
+        env:
+          DATABASE_URL: ${{ steps.branch.outputs.db_url }}
+          DIRECT_URL: ${{ steps.branch.outputs.db_url }}
+        run: pnpm install --frozen-lockfile
+      - name: Apply Prisma migrations to Neon branch
+        if: inputs.prisma-migrate
+        env:
+          DATABASE_URL: ${{ steps.branch.outputs.db_url }}
+          DIRECT_URL: ${{ steps.branch.outputs.db_url }}
+        run: pnpm exec prisma migrate deploy
 
   delete:
     # Dependabot-triggered events get Dependabot's secrets, not the repository's,
     # so there is no Neon key to delete with.
     if: github.event.action == 'closed' && github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]'
     runs-on: ubuntu-latest
+    concurrency:
+      group: neon-branches-${{ github.repository }}-${{ github.event.number }}
+      cancel-in-progress: false
     steps:
       - name: Resolve Neon branch
         id: neon
@@ -132,3 +332,69 @@ jobs:
             echo "$out" >&2
             exit 1
           fi
+      # Removes only the two keys this workflow manages (see the inputs), scoped
+      # to this head ref and the preview target, so branch-scoped variables set by
+      # hand survive. As above, nothing from the PR is interpolated into the script.
+      - name: Delete Vercel preview env vars
+        if: inputs.vercel-preview-env
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID || vars.VERCEL_PROJECT_ID }}
+          VERCEL_TEAM_ID: ${{ secrets.VERCEL_TEAM_ID || vars.VERCEL_TEAM_ID }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID || vars.VERCEL_ORG_ID }}
+          GIT_BRANCH: ${{ github.head_ref }}
+          DB_URL_KEY: ${{ inputs.vercel-database-url-key }}
+          DIRECT_URL_KEY: ${{ inputs.vercel-direct-url-key }}
+        run: |
+          if [ -z "$VERCEL_TOKEN" ] || [ -z "$VERCEL_PROJECT_ID" ]; then
+            echo "::error::vercel-preview-env needs VERCEL_TOKEN (secret) and VERCEL_PROJECT_ID (secret or variable)."
+            exit 1
+          fi
+          if [ -z "$VERCEL_TEAM_ID" ] && [[ "$VERCEL_ORG_ID" == team_* ]]; then
+            VERCEL_TEAM_ID="$VERCEL_ORG_ID"
+          fi
+          team=()
+          [ -n "$VERCEL_TEAM_ID" ] && team=(--data-urlencode "teamId=$VERCEL_TEAM_ID")
+          base="https://api.vercel.com"
+          auth="Authorization: Bearer $VERCEL_TOKEN"
+          list="$(mktemp)"
+
+          code="$(curl -sS -G -o "$list" -w '%{http_code}' -H "$auth" "${team[@]}" \
+            --data-urlencode "gitBranch=$GIT_BRANCH" \
+            "$base/v10/projects/${VERCEL_PROJECT_ID}/env")" || code=000
+          case "$code" in
+            2??) ;;
+            # A 404 here usually means a missing or wrong team ID, not an empty
+            # project; failing beats silently leaking the branch's vars.
+            *)
+              echo "::error::Listing Vercel env vars failed: HTTP $code"
+              exit 1
+              ;;
+          esac
+
+          # Filter again client-side in case the API ignores the gitBranch query.
+          ids="$(jq -r '
+            [$ENV.DB_URL_KEY, $ENV.DIRECT_URL_KEY] as $keys
+            | .envs[]?
+            | select(.gitBranch == $ENV.GIT_BRANCH
+                and ((.target // []) | if type == "array" then . else [.] end | index("preview"))
+                and (.key as $k | $keys | index($k)))
+            | "\(.id) \(.key)"' "$list")"
+          rm -f "$list"
+          if [ -z "$ids" ]; then
+            echo "No Vercel preview env vars for branch $GIT_BRANCH."
+            exit 0
+          fi
+
+          while read -r id key; do
+            code="$(curl -sS -o /dev/null -w '%{http_code}' -X DELETE -H "$auth" "${team[@]}" -G \
+              "$base/v9/projects/${VERCEL_PROJECT_ID}/env/${id}")" || code=000
+            case "$code" in
+              2??) echo "Deleted $key from Vercel (preview, branch $GIT_BRANCH)." ;;
+              404) echo "$key already gone from Vercel." ;;
+              *)
+                echo "::error::Deleting $key from Vercel failed: HTTP $code"
+                exit 1
+                ;;
+            esac
+          done <<<"$ids"
