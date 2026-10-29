@@ -35,19 +35,26 @@
 # seeded/scrubbed branch such as `development`, never main/production, because
 # PR code runs against branches copied from it.
 #
-# Vercel (optional): when VERCEL_TOKEN (secret) is set, `create` also upserts the
-# new branch's connection strings as Vercel project env vars scoped to the
-# preview target and the PR's head ref (`gitBranch`), so that PR's preview
-# deploys use its own Neon branch instead of the shared DATABASE_URL. `delete`
-# removes them again. Without VERCEL_TOKEN both steps log a notice and skip.
-# Needs VERCEL_PROJECT_ID (secret or var) and, for a team project,
-# VERCEL_TEAM_ID (secret or var). The pooled URL goes to the key named by
-# `vercel-database-url-key` (default DATABASE_URL), the direct URL to
-# `vercel-direct-url-key` (default DIRECT_URL; empty disables it). The token
-# needs write access to the project's env vars.
+# Vercel (opt-in, `vercel-preview-env: true`): `create` also upserts the new
+# branch's connection strings as Vercel project env vars scoped to the preview
+# target and the PR's head ref (`gitBranch`), so that PR's preview deploys use
+# its own Neon branch instead of the shared Preview DATABASE_URL. `delete`
+# removes them again, and neon-sweep.yml removes any whose PR or Neon branch is
+# gone. It is opt-in because every caller already has VERCEL_TOKEN for ci.yml.
+# Needs VERCEL_TOKEN (secret, write access to the project's env vars),
+# VERCEL_PROJECT_ID and, for a team project, VERCEL_TEAM_ID or VERCEL_ORG_ID
+# (secret or var; a `team_` ID is required for team projects). The pooled URL
+# goes to the key named by `vercel-database-url-key` (default DATABASE_URL),
+# the direct URL to `vercel-direct-url-key` (default DIRECT_URL; empty disables
+# it). The vars carry the comment "managed by crashoutcompany/.github
+# neon-branches", which is how the sweep tells them from hand-made ones.
+# With this on, the parent must not be the Neon project's default branch: the
+# job fails instead of handing preview deploys a copy of production.
 # Race: Vercel starts the first preview build of a newly opened PR in parallel
 # with this job, so that build may run before the env vars exist and read the
-# fallback value. Redeploy the preview once (or push again) after this job passes.
+# shared Preview value. Point the shared Preview DATABASE_URL at a scrubbed
+# branch so that build is harmless, and redeploy (or push) for the PR's own
+# branch. PRs opened before this was turned on get their vars on reopen.
 #
 # Preview branches also expire `expires-in-days` days (default 30) after creation,
 # as a safety net for PRs abandoned without being closed. This workflow only runs
@@ -74,8 +81,12 @@ on:
         description: Days until a preview branch expires. 0 disables expiry.
         type: number
         default: 30
+      vercel-preview-env:
+        description: Publish the PR branch's Neon URLs as Vercel preview env vars for the PR's head ref, and remove them on close.
+        type: boolean
+        default: false
       vercel-database-url-key:
-        description: Vercel env var that receives the pooled Neon URL (only used when VERCEL_TOKEN is set).
+        description: Vercel env var that receives the pooled Neon URL (only used with vercel-preview-env).
         type: string
         default: DATABASE_URL
       vercel-direct-url-key:
@@ -110,6 +121,35 @@ jobs:
             echo "::error::Set the NEON_CI_PARENT_BRANCH repository variable (or the neon-parent input) to a seeded/scrubbed Neon branch. PR branches must not be copied from production."
             exit 1
           fi
+      # Preview deploys serve real traffic (and may allow test login), so with
+      # vercel-preview-env they must never get a copy of production. The
+      # project's default branch is production; refuse it by name or ID.
+      - name: Refuse the default branch as a Vercel preview parent
+        if: inputs.vercel-preview-env
+        env:
+          NEON_API_KEY: ${{ secrets.NEON_API_KEY }}
+          NEON_PROJECT_ID: ${{ secrets.NEON_PROJECT_ID || vars.NEON_PROJECT_ID }}
+          NEON_PARENT: ${{ inputs.neon-parent || vars.NEON_CI_PARENT_BRANCH }}
+        run: |
+          body="$(mktemp)"
+          code="$(curl -sS -o "$body" -w '%{http_code}' \
+            -H "Authorization: Bearer $NEON_API_KEY" -H 'Accept: application/json' \
+            "https://console.neon.tech/api/v2/projects/${NEON_PROJECT_ID}/branches")" || code=000
+          if [ "${code:0:1}" != 2 ]; then
+            echo "::error::Listing Neon branches failed: HTTP $code"
+            exit 1
+          fi
+          default="$(jq -r '.branches[] | select(.default == true) | "\(.id) \(.name)"' "$body")"
+          rm -f "$body"
+          read -r default_id default_name <<<"$default"
+          if [ -z "$default_id" ]; then
+            echo "::error::Could not find the Neon project's default branch."
+            exit 1
+          fi
+          if [ "$NEON_PARENT" = "$default_id" ] || [ "$NEON_PARENT" = "$default_name" ]; then
+            echo "::error::NEON_CI_PARENT_BRANCH ($NEON_PARENT) is the Neon project's default (production) branch. Point it at a scrubbed branch before turning on vercel-preview-env."
+            exit 1
+          fi
       - name: Create Neon branch
         id: branch
         uses: neondatabase/create-branch-action@v6
@@ -126,23 +166,26 @@ jobs:
       # The Vercel scope is the raw head ref (what Vercel matches deployments
       # against), not the sanitized Neon branch name.
       - name: Publish Neon URLs to Vercel preview env
+        if: inputs.vercel-preview-env
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
           VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID || vars.VERCEL_PROJECT_ID }}
           VERCEL_TEAM_ID: ${{ secrets.VERCEL_TEAM_ID || vars.VERCEL_TEAM_ID }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID || vars.VERCEL_ORG_ID }}
           GIT_BRANCH: ${{ github.head_ref }}
           DB_URL_KEY: ${{ inputs.vercel-database-url-key }}
           DIRECT_URL_KEY: ${{ inputs.vercel-direct-url-key }}
           POOLED_URL: ${{ steps.branch.outputs.db_url_pooled }}
           DIRECT_URL: ${{ steps.branch.outputs.db_url }}
         run: |
-          if [ -z "$VERCEL_TOKEN" ]; then
-            echo "::notice::VERCEL_TOKEN is not set; skipping Vercel preview env update."
-            exit 0
-          fi
-          if [ -z "$VERCEL_PROJECT_ID" ]; then
-            echo "::error::VERCEL_TOKEN is set but VERCEL_PROJECT_ID (secret or variable) is not."
+          if [ -z "$VERCEL_TOKEN" ] || [ -z "$VERCEL_PROJECT_ID" ]; then
+            echo "::error::vercel-preview-env needs VERCEL_TOKEN (secret) and VERCEL_PROJECT_ID (secret or variable)."
             exit 1
+          fi
+          # ci.yml's VERCEL_ORG_ID is the team ID for team projects (team_...)
+          # and a user ID otherwise, which the API must not get as teamId.
+          if [ -z "$VERCEL_TEAM_ID" ] && [[ "$VERCEL_ORG_ID" == team_* ]]; then
+            VERCEL_TEAM_ID="$VERCEL_ORG_ID"
           fi
           [ -n "$POOLED_URL" ] && echo "::add-mask::$POOLED_URL"
           [ -n "$DIRECT_URL" ] && echo "::add-mask::$DIRECT_URL"
@@ -157,7 +200,8 @@ jobs:
             body="$(mktemp)"
             code="$(KEY="$key" VALUE="$value" jq -n '{
                 key: $ENV.KEY, value: $ENV.VALUE, type: "encrypted",
-                target: ["preview"], gitBranch: $ENV.GIT_BRANCH
+                target: ["preview"], gitBranch: $ENV.GIT_BRANCH,
+                comment: "managed by crashoutcompany/.github neon-branches"
               }' | curl -sS -o "$body" -w '%{http_code}' -X POST "$api" \
                 -H "Authorization: Bearer $VERCEL_TOKEN" \
                 -H 'Content-Type: application/json' --data-binary @-)" || code=000
@@ -223,21 +267,22 @@ jobs:
       # to this head ref and the preview target, so branch-scoped variables set by
       # hand survive. As above, nothing from the PR is interpolated into the script.
       - name: Delete Vercel preview env vars
+        if: inputs.vercel-preview-env
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
           VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID || vars.VERCEL_PROJECT_ID }}
           VERCEL_TEAM_ID: ${{ secrets.VERCEL_TEAM_ID || vars.VERCEL_TEAM_ID }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID || vars.VERCEL_ORG_ID }}
           GIT_BRANCH: ${{ github.head_ref }}
           DB_URL_KEY: ${{ inputs.vercel-database-url-key }}
           DIRECT_URL_KEY: ${{ inputs.vercel-direct-url-key }}
         run: |
-          if [ -z "$VERCEL_TOKEN" ]; then
-            echo "::notice::VERCEL_TOKEN is not set; skipping Vercel preview env cleanup."
-            exit 0
-          fi
-          if [ -z "$VERCEL_PROJECT_ID" ]; then
-            echo "::error::VERCEL_TOKEN is set but VERCEL_PROJECT_ID (secret or variable) is not."
+          if [ -z "$VERCEL_TOKEN" ] || [ -z "$VERCEL_PROJECT_ID" ]; then
+            echo "::error::vercel-preview-env needs VERCEL_TOKEN (secret) and VERCEL_PROJECT_ID (secret or variable)."
             exit 1
+          fi
+          if [ -z "$VERCEL_TEAM_ID" ] && [[ "$VERCEL_ORG_ID" == team_* ]]; then
+            VERCEL_TEAM_ID="$VERCEL_ORG_ID"
           fi
           team=()
           [ -n "$VERCEL_TEAM_ID" ] && team=(--data-urlencode "teamId=$VERCEL_TEAM_ID")
@@ -250,7 +295,8 @@ jobs:
             "$base/v10/projects/${VERCEL_PROJECT_ID}/env")" || code=000
           case "$code" in
             2??) ;;
-            404) echo "Vercel project not found; nothing to delete."; exit 0 ;;
+            # A 404 here usually means a missing or wrong team ID, not an empty
+            # project; failing beats silently leaking the branch's vars.
             *)
               echo "::error::Listing Vercel env vars failed: HTTP $code"
               exit 1

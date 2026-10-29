@@ -31,6 +31,13 @@
 # app's Neon API key. See the README.
 #
 # Reads NEON_API_KEY and NEON_PROJECT_ID (secret or var) from the calling repository.
+#
+# With `vercel-preview-env: true` (set it when neon-branches.yml has it) the
+# sweep also deletes the Vercel preview env vars neon-branches.yml published
+# (marked by their comment) whose PR is no longer open or whose Neon branch is
+# gone, e.g. expired. Otherwise those vars would keep pointing preview deploys
+# at a deleted endpoint. Reads VERCEL_TOKEN, VERCEL_PROJECT_ID and
+# VERCEL_TEAM_ID or VERCEL_ORG_ID, as neon-branches.yml does.
 name: neon-sweep
 
 on:
@@ -44,6 +51,10 @@ on:
         description: Age after which a ci/e2e-* branch counts as leaked. Keep it above the e2e job timeout.
         type: number
         default: 6
+      vercel-preview-env:
+        description: Also delete stale Vercel preview env vars published by neon-branches.yml.
+        type: boolean
+        default: false
 
 jobs:
   sweep:
@@ -126,4 +137,87 @@ jobs:
           done <<<"$rows"
 
           echo "Done: $deleted branch(es) $([ "$DRY_RUN" = true ] && echo "would be ")deleted, $failed failed."
+          [ "$failed" -eq 0 ]
+      # Runs after the Neon sweep so branches it just deleted count as gone.
+      # Nothing from a PR is interpolated into the script; head refs come back
+      # from the Vercel API and only reach commands as quoted arguments.
+      - name: Delete stale Vercel preview env vars
+        if: ${{ !cancelled() && inputs.vercel-preview-env }}
+        env:
+          NEON_API_KEY: ${{ secrets.NEON_API_KEY }}
+          NEON_PROJECT_ID: ${{ secrets.NEON_PROJECT_ID || vars.NEON_PROJECT_ID }}
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID || vars.VERCEL_PROJECT_ID }}
+          VERCEL_TEAM_ID: ${{ secrets.VERCEL_TEAM_ID || vars.VERCEL_TEAM_ID }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID || vars.VERCEL_ORG_ID }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          DRY_RUN: ${{ inputs.dry-run && 'true' || 'false' }}
+        run: |
+          set -euo pipefail
+          if [ -z "$VERCEL_TOKEN" ] || [ -z "$VERCEL_PROJECT_ID" ]; then
+            echo "::error::vercel-preview-env needs VERCEL_TOKEN (secret) and VERCEL_PROJECT_ID (secret or variable)."
+            exit 1
+          fi
+          if [ -z "$VERCEL_TEAM_ID" ] && [[ "$VERCEL_ORG_ID" == team_* ]]; then
+            VERCEL_TEAM_ID="$VERCEL_ORG_ID"
+          fi
+          team=()
+          [ -n "$VERCEL_TEAM_ID" ] && team=(--data-urlencode "teamId=$VERCEL_TEAM_ID")
+          base="https://api.vercel.com"
+          auth="Authorization: Bearer $VERCEL_TOKEN"
+          marker="managed by crashoutcompany/.github neon-branches"
+
+          neon_names=$(neonctl branches list --project-id "$NEON_PROJECT_ID" --output json \
+            | jq -r 'if type == "array" then .[].name else error("neonctl branches list did not return an array") end')
+
+          list="$(mktemp)"
+          code="$(curl -sS -G -o "$list" -w '%{http_code}' -H "$auth" "${team[@]}" \
+            "$base/v10/projects/${VERCEL_PROJECT_ID}/env")" || code=000
+          if [ "${code:0:1}" != 2 ]; then
+            echo "::error::Listing Vercel env vars failed: HTTP $code"
+            exit 1
+          fi
+          # One "id<TAB>key<TAB>gitBranch" line per managed var.
+          rows=$(MARKER="$marker" jq -r '
+            .envs[]? | select(.comment == $ENV.MARKER and (.gitBranch // "") != "")
+            | [.id, .key, .gitBranch] | @tsv' "$list")
+          rm -f "$list"
+
+          failed=0
+          deleted=0
+          while IFS=$'\t' read -r id key ref; do
+            [ -n "$id" ] || continue
+            if ! number=$(gh pr list --head "$ref" --state open --json number --jq '.[0].number // ""' 2>&1); then
+              echo "::warning::Skipping $key for $ref: could not look up its PR: $number"
+              continue
+            fi
+            if [ -z "$number" ]; then
+              reason="no open PR for $ref"
+            else
+              safe_ref="$(printf '%s' "$ref" | tr -c 'A-Za-z0-9._-' '-')"
+              grep -qxF "preview/pr-$number-$safe_ref" <<<"$neon_names" && continue
+              reason="Neon branch of PR #$number is gone"
+            fi
+
+            if [ "$DRY_RUN" = true ]; then
+              echo "would delete Vercel $key ($ref): $reason"
+              deleted=$((deleted + 1))
+              continue
+            fi
+            code="$(curl -sS -o /dev/null -w '%{http_code}' -X DELETE -H "$auth" "${team[@]}" -G \
+              "$base/v9/projects/${VERCEL_PROJECT_ID}/env/${id}")" || code=000
+            case "$code" in
+              2??|404)
+                echo "deleted Vercel $key ($ref): $reason"
+                deleted=$((deleted + 1))
+                ;;
+              *)
+                echo "::warning::Failed to delete Vercel $key ($ref): HTTP $code"
+                failed=$((failed + 1))
+                ;;
+            esac
+          done <<<"$rows"
+
+          echo "Done: $deleted Vercel var(s) $([ "$DRY_RUN" = true ] && echo "would be ")deleted, $failed failed."
           [ "$failed" -eq 0 ]
