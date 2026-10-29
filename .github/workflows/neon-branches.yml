@@ -2,7 +2,8 @@
 # per same-repo PR, created on open/reopen and deleted on close. ci.yml's e2e
 # job does not use it: PR e2e runs get their own throwaway `ci/e2e-*` branch.
 #
-# Callers:
+# Callers (add `synchronize` when using `prisma-migrate`, so later pushes'
+# migrations reach the branch too; creating an existing branch is a no-op):
 #   on:
 #     pull_request:
 #       types: [opened, reopened]
@@ -21,13 +22,23 @@
 # workflows (closed included) for PRs with merge conflicts, so a PR closed while
 # conflicting would keep its Neon branch. That is safe here: the workflow runs
 # from the base branch and the `delete` job only calls the Neon API. Never add a
-# checkout of the PR head or run PR code in this workflow.
+# checkout of the PR head or run PR code in the `delete` job, or anywhere on
+# pull_request_target. The one exception is `prisma-migrate` below.
 #
 # The branch name comes from the PR's head ref, which neondatabase's actions
 # paste into shell scripts, so it is reduced to [A-Za-z0-9._-] (`/` and anything
 # else becomes `-`).
 #
 # Missed deletes (and branches recreated after one) are caught by neon-sweep.yml.
+#
+# Migrations (opt-in, `prisma-migrate: true`): after everything else, `create`
+# checks out the PR, installs it and runs `prisma migrate deploy` against the
+# branch's direct URL, so the preview deploy sees the PR's schema. This runs PR
+# code, so it only happens on `pull_request` for same-repo, non-Dependabot PRs
+# (the same trust as ci.yml's e2e job), never on pull_request_target, and it
+# must stay the last step of the job: nothing that holds NEON_API_KEY or
+# VERCEL_TOKEN may run after PR code on the same runner. The first preview build
+# of a PR can still finish before the migration does; redeploy (or push) once.
 #
 # Reads NEON_API_KEY and NEON_PROJECT_ID (secret or var), plus optional
 # NEON_DATABASE / NEON_ROLE (secret or var) from the calling repository.
@@ -77,6 +88,18 @@ on:
         description: Neon branch that PR branches are created from. Overrides NEON_CI_PARENT_BRANCH (variable). Required.
         type: string
         default: ""
+      prisma-migrate:
+        description: Check out the PR and run `prisma migrate deploy` on its Neon branch (direct URL). Runs PR code; pull_request events only.
+        type: boolean
+        default: false
+      node-version:
+        description: Node.js version for prisma-migrate.
+        type: string
+        default: "24"
+      pnpm-version:
+        description: pnpm version for prisma-migrate.
+        type: string
+        default: "10.1.0"
       expires-in-days:
         description: Days until a preview branch expires. 0 disables expiry.
         type: number
@@ -98,6 +121,11 @@ jobs:
   create:
     if: github.event.action != 'closed' && github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]'
     runs-on: ubuntu-latest
+    # One run per PR at a time, so rapid pushes migrate in order and a close
+    # waits for a running create.
+    concurrency:
+      group: neon-branches-${{ github.repository }}-${{ github.event.number }}
+      cancel-in-progress: false
     steps:
       - name: Resolve Neon branch
         id: neon
@@ -124,6 +152,11 @@ jobs:
       # Preview deploys serve real traffic (and may allow test login), so with
       # vercel-preview-env they must never get a copy of production. The
       # project's default branch is production; refuse it by name or ID.
+      - name: Require pull_request for prisma-migrate
+        if: inputs.prisma-migrate && github.event_name != 'pull_request'
+        run: |
+          echo "::error::prisma-migrate runs PR code, so it only runs on pull_request events, not $GITHUB_EVENT_NAME."
+          exit 1
       - name: Refuse the default branch as a Vercel preview parent
         if: inputs.vercel-preview-env
         env:
@@ -228,12 +261,48 @@ jobs:
             fi
             upsert "$DIRECT_URL_KEY" "$DIRECT_URL"
           fi
+      # PR code from here on. Keep these steps last: see the header.
+      # Credentials are not persisted, and only this branch's URLs (never
+      # repository secrets) are in the environment. migrate deploy takes
+      # advisory locks, which don't work through the pooler, so both variables
+      # get the direct URL, as in ci.yml.
+      - name: Check out PR
+        if: inputs.prisma-migrate
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Set up pnpm
+        if: inputs.prisma-migrate
+        uses: pnpm/action-setup@v4
+        with:
+          version: ${{ inputs.pnpm-version }}
+      - name: Set up Node.js
+        if: inputs.prisma-migrate
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: pnpm
+      - name: Install dependencies
+        if: inputs.prisma-migrate
+        env:
+          DATABASE_URL: ${{ steps.branch.outputs.db_url }}
+          DIRECT_URL: ${{ steps.branch.outputs.db_url }}
+        run: pnpm install --frozen-lockfile
+      - name: Apply Prisma migrations to Neon branch
+        if: inputs.prisma-migrate
+        env:
+          DATABASE_URL: ${{ steps.branch.outputs.db_url }}
+          DIRECT_URL: ${{ steps.branch.outputs.db_url }}
+        run: pnpm exec prisma migrate deploy
 
   delete:
     # Dependabot-triggered events get Dependabot's secrets, not the repository's,
     # so there is no Neon key to delete with.
     if: github.event.action == 'closed' && github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]'
     runs-on: ubuntu-latest
+    concurrency:
+      group: neon-branches-${{ github.repository }}-${{ github.event.number }}
+      cancel-in-progress: false
     steps:
       - name: Resolve Neon branch
         id: neon

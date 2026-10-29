@@ -43,17 +43,29 @@ for `ci.yml`.
   Preview `DATABASE_URL`. Point that value at a scrubbed branch too, never
   production. Redeploy (or push) to switch the preview to the PR's own branch.
 - PRs opened before you turn this on get their vars when reopened.
-- Migrations are not applied to preview branches. A PR that changes the schema
+- Migrations: with `prisma-migrate: true` the `create` job also checks out the
+  PR and runs `prisma migrate deploy` on its branch (direct URL). Add
+  `synchronize` to the caller's `pull_request` types so migrations from later
+  pushes land too; rerunning `create` on an existing branch is a no-op. This
+  runs PR code, so it only runs on `pull_request` (same-repo, non-Dependabot)
+  and stays the job's last step. `node-version` / `pnpm-version` default to
+  `24` / `10.1.0`, as in `ci.yml`. Without it, a PR that changes the schema
   gets a preview on the parent's schema.
 
 Caller:
 
 ```yaml
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+  pull_request_target:
+    types: [closed]
 jobs:
   neon:
     uses: crashoutcompany/.github/.github/workflows/neon-branches.yml@<full commit sha> # v1
     with:
       vercel-preview-env: true
+      prisma-migrate: true
     secrets: inherit
   sweep:
     uses: crashoutcompany/.github/.github/workflows/neon-sweep.yml@<full commit sha> # v1
