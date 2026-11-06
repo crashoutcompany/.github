@@ -221,7 +221,8 @@ jobs:
           fi
 
   e2e:
-    if: inputs.has-e2e && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]'))
+    # Also check the PR author: a human re-run of a Dependabot PR makes the human the actor.
+    if: inputs.has-e2e && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]' && github.event.pull_request.user.login != 'dependabot[bot]'))
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
