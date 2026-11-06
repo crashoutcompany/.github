@@ -119,7 +119,8 @@ on:
 
 jobs:
   create:
-    if: github.event.action != 'closed' && github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]'
+    # Also check the PR author: a human re-run of a Dependabot PR makes the human the actor.
+    if: github.event.action != 'closed' && github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]' && github.event.pull_request.user.login != 'dependabot[bot]'
     runs-on: ubuntu-latest
     # One run per PR at a time, so rapid pushes migrate in order and a close
     # waits for a running create.
@@ -298,7 +299,7 @@ jobs:
   delete:
     # Dependabot-triggered events get Dependabot's secrets, not the repository's,
     # so there is no Neon key to delete with.
-    if: github.event.action == 'closed' && github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]'
+    if: github.event.action == 'closed' && github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]' && github.event.pull_request.user.login != 'dependabot[bot]'
     runs-on: ubuntu-latest
     concurrency:
       group: neon-branches-${{ github.repository }}-${{ github.event.number }}
