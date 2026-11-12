@@ -185,6 +185,13 @@ jobs:
         with:
           node-version: ${{ inputs.node-version }}
           cache: pnpm
+      - name: Cache Next.js build cache
+        uses: actions/cache@v4
+        with:
+          path: .next/cache
+          key: ${{ runner.os }}-nextjs-build-${{ hashFiles('**/pnpm-lock.yaml') }}-${{ hashFiles('**/*.js', '**/*.jsx', '**/*.ts', '**/*.tsx', '!**/node_modules/**', '!.next/**') }}
+          restore-keys: |
+            ${{ runner.os }}-nextjs-build-${{ hashFiles('**/pnpm-lock.yaml') }}-
       - run: pnpm install --frozen-lockfile ${{ inputs.install-flags }}
       - run: pnpm add --global vercel@latest
       - name: Pull Vercel environment and build
@@ -234,6 +241,14 @@ jobs:
         with:
           node-version: ${{ inputs.node-version }}
           cache: pnpm
+
+      - name: Cache Next.js build cache
+        uses: actions/cache@v4
+        with:
+          path: .next/cache
+          key: ${{ runner.os }}-nextjs-e2e-${{ hashFiles('**/pnpm-lock.yaml') }}-${{ hashFiles('**/*.js', '**/*.jsx', '**/*.ts', '**/*.tsx', '!**/node_modules/**', '!.next/**') }}
+          restore-keys: |
+            ${{ runner.os }}-nextjs-e2e-${{ hashFiles('**/pnpm-lock.yaml') }}-
 
       - name: Expose requested secrets
         if: inputs.e2e-secrets != ''
