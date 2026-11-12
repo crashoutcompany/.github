@@ -112,3 +112,8 @@ git tag v2 && git push origin v2              # breaking; bump callers one at a 
   `NEXT_PUBLIC_*` values the build needs); `DATABASE_URL`, `DIRECT_URL`,
   `BETTER_AUTH_SECRET` and `TEST_AUTH_SECRET` default to the CI fixtures. e2e
   stays skipped for Dependabot. The build output is never deployed.
+- `e2e-secret-names` (default empty): JSON array of secret names for the e2e
+  job, e.g. `'["RESEND_API_KEY","NEXT_PUBLIC_POSTHOG_KEY"]'` (max 16). The step
+  looks up only those names; it does not use `toJSON(secrets)`. Replaces the
+  space-separated `e2e-secrets`, which still works (and is ignored when
+  `e2e-secret-names` is set) but puts every secret in one step's env.

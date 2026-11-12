@@ -20,7 +20,7 @@
 #     Point it at a seeded/scrubbed branch, never the production branch:
 #     PR code runs against branches copied from it.
 #   DATABASE_URL, DIRECT_URL, BETTER_AUTH_SECRET, TEST_AUTH_SECRET (optional; else Vercel, else CI-only value)
-#   Any names listed in `e2e-secrets`                (e2e)
+#   Any names listed in `e2e-secret-names` (JSON array) or `e2e-secrets` (space-separated) (e2e)
 name: ci
 
 on:
@@ -90,6 +90,10 @@ on:
         description: Space-separated repository secret names to expose to the e2e job.
         type: string
         default: ""
+      e2e-secret-names:
+        description: 'JSON array of repository secret names to expose to the e2e job (max 16), e.g. ["RESEND_API_KEY"]. Only these secrets are looked up, one by name; toJSON(secrets) is not used. When set, e2e-secrets is ignored.'
+        type: string
+        default: ""
       dependabot-build:
         description: Also run the build job for Dependabot PRs. Dependabot runs have no Actions secrets, so it skips `vercel pull`/`vercel build` and runs the caller's package.json script from `dependabot-build-script` with placeholder env. e2e stays skipped for Dependabot.
         type: boolean
@@ -102,6 +106,7 @@ on:
         description: Placeholder env for the Dependabot build, one KEY=VALUE per line (blank lines and # comments ignored). Not secrets. DATABASE_URL, DIRECT_URL, BETTER_AUTH_SECRET and TEST_AUTH_SECRET default to the CI fixtures.
         type: string
         default: ""
+
 env:
   # Fixtures for lint/test against the job's Postgres service. Not real secrets.
   DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/ci?schema=public
@@ -295,8 +300,52 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-nextjs-e2e-${{ hashFiles('**/pnpm-lock.yaml') }}-
 
+      - name: Expose requested secrets (named)
+        if: inputs.e2e-secret-names != ''
+        env:
+          NAMES: ${{ inputs.e2e-secret-names }}
+          V0: ${{ fromJSON(inputs.e2e-secret-names || '[]')[0] && secrets[fromJSON(inputs.e2e-secret-names || '[]')[0]] || '' }}
+          V1: ${{ fromJSON(inputs.e2e-secret-names || '[]')[1] && secrets[fromJSON(inputs.e2e-secret-names || '[]')[1]] || '' }}
+          V2: ${{ fromJSON(inputs.e2e-secret-names || '[]')[2] && secrets[fromJSON(inputs.e2e-secret-names || '[]')[2]] || '' }}
+          V3: ${{ fromJSON(inputs.e2e-secret-names || '[]')[3] && secrets[fromJSON(inputs.e2e-secret-names || '[]')[3]] || '' }}
+          V4: ${{ fromJSON(inputs.e2e-secret-names || '[]')[4] && secrets[fromJSON(inputs.e2e-secret-names || '[]')[4]] || '' }}
+          V5: ${{ fromJSON(inputs.e2e-secret-names || '[]')[5] && secrets[fromJSON(inputs.e2e-secret-names || '[]')[5]] || '' }}
+          V6: ${{ fromJSON(inputs.e2e-secret-names || '[]')[6] && secrets[fromJSON(inputs.e2e-secret-names || '[]')[6]] || '' }}
+          V7: ${{ fromJSON(inputs.e2e-secret-names || '[]')[7] && secrets[fromJSON(inputs.e2e-secret-names || '[]')[7]] || '' }}
+          V8: ${{ fromJSON(inputs.e2e-secret-names || '[]')[8] && secrets[fromJSON(inputs.e2e-secret-names || '[]')[8]] || '' }}
+          V9: ${{ fromJSON(inputs.e2e-secret-names || '[]')[9] && secrets[fromJSON(inputs.e2e-secret-names || '[]')[9]] || '' }}
+          V10: ${{ fromJSON(inputs.e2e-secret-names || '[]')[10] && secrets[fromJSON(inputs.e2e-secret-names || '[]')[10]] || '' }}
+          V11: ${{ fromJSON(inputs.e2e-secret-names || '[]')[11] && secrets[fromJSON(inputs.e2e-secret-names || '[]')[11]] || '' }}
+          V12: ${{ fromJSON(inputs.e2e-secret-names || '[]')[12] && secrets[fromJSON(inputs.e2e-secret-names || '[]')[12]] || '' }}
+          V13: ${{ fromJSON(inputs.e2e-secret-names || '[]')[13] && secrets[fromJSON(inputs.e2e-secret-names || '[]')[13]] || '' }}
+          V14: ${{ fromJSON(inputs.e2e-secret-names || '[]')[14] && secrets[fromJSON(inputs.e2e-secret-names || '[]')[14]] || '' }}
+          V15: ${{ fromJSON(inputs.e2e-secret-names || '[]')[15] && secrets[fromJSON(inputs.e2e-secret-names || '[]')[15]] || '' }}
+        run: |
+          count="$(jq -e 'if type == "array" and all(.[]; type == "string") then length else error("not an array of strings") end' <<<"$NAMES")" \
+            || { echo "::error::e2e-secret-names must be a JSON array of strings"; exit 1; }
+          if [ "$count" -gt 16 ]; then
+            echo "::error::e2e-secret-names supports at most 16 names"
+            exit 1
+          fi
+          for i in $(seq 0 $((count - 1))); do
+            name="$(jq -r --argjson i "$i" '.[$i]' <<<"$NAMES")"
+            if [[ ! "$name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+              echo "::error::Invalid secret name in e2e-secret-names"
+              exit 1
+            fi
+            var="V$i"
+            value="${!var}"
+            if [ -z "$value" ]; then
+              echo "::warning::Secret $name is not set"
+              continue
+            fi
+            echo "::add-mask::$value"
+            delim="EOF_$(openssl rand -hex 8)"
+            printf '%s<<%s\n%s\n%s\n' "$name" "$delim" "$value" "$delim" >> "$GITHUB_ENV"
+          done
+
       - name: Expose requested secrets
-        if: inputs.e2e-secrets != ''
+        if: inputs.e2e-secrets != '' && inputs.e2e-secret-names == ''
         env:
           ALL_SECRETS: ${{ toJSON(secrets) }}
           NAMES: ${{ inputs.e2e-secrets }}
@@ -307,6 +356,7 @@ jobs:
               echo "::warning::Secret $name is not set"
               continue
             fi
+            echo "::add-mask::$value"
             delim="EOF_$(openssl rand -hex 8)"
             printf '%s<<%s\n%s\n%s\n' "$name" "$delim" "$value" "$delim" >> "$GITHUB_ENV"
           done
