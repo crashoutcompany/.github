@@ -134,3 +134,24 @@ git tag v1.2.0 && git push origin v1.2.0      # immutable; Dependabot bumps to t
 git tag -f v1 && git push -f origin v1        # non-breaking, moving major
 git tag v2 && git push origin v2              # breaking; bump callers one at a time
 ```
+
+## `ci.yml` options
+
+- `postgres-service` (default `true`): lint and test start a Postgres 16
+  service container. Set `false` for an app with no database (Project-View) to
+  skip it. The service's `image` is an expression that is `''` when off;
+  GitHub documents that a service whose image is an empty string does not start.
+- `dependabot-build` (default `false`): by default build and e2e skip Dependabot
+  PRs because they need secrets, so a bump merges on lint and unit tests only.
+  With `true`, the build job also runs for Dependabot (or a human re-run of its
+  PR) without `vercel pull`/`vercel build`: it runs
+  `pnpm run <dependabot-build-script>` (default `build`) with placeholder env.
+  `dependabot-build-env` is a multiline `KEY=VALUE` list (e.g. public
+  `NEXT_PUBLIC_*` values the build needs); `DATABASE_URL`, `DIRECT_URL`,
+  `BETTER_AUTH_SECRET` and `TEST_AUTH_SECRET` default to the CI fixtures. e2e
+  stays skipped for Dependabot. The build output is never deployed.
+- `e2e-secret-names` (default empty): JSON array of secret names for the e2e
+  job, e.g. `'["RESEND_API_KEY","NEXT_PUBLIC_POSTHOG_KEY"]'` (max 16). The step
+  looks up only those names; it does not use `toJSON(secrets)`. Replaces the
+  space-separated `e2e-secrets`, which still works (and is ignored when
+  `e2e-secret-names` is set) but puts every secret in one step's env.
