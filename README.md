@@ -96,3 +96,10 @@ git tag v1.2.0 && git push origin v1.2.0      # immutable; Dependabot bumps to t
 git tag -f v1 && git push -f origin v1        # non-breaking, moving major
 git tag v2 && git push origin v2              # breaking; bump callers one at a time
 ```
+
+## `ci.yml` options
+
+- `postgres-service` (default `true`): lint and test start a Postgres 16
+  service container. Set `false` for an app with no database (Project-View) to
+  skip it. The service's `image` is an expression that is `''` when off;
+  GitHub documents that a service whose image is an empty string does not start.

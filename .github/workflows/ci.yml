@@ -39,6 +39,10 @@ on:
         description: Run `prisma db push` + `prisma generate --sql` against the CI Postgres before lint/test.
         type: boolean
         default: false
+      postgres-service:
+        description: Start a Postgres 16 service container for the lint and test jobs. Set false for apps without a database to skip it.
+        type: boolean
+        default: true
       has-typecheck:
         type: boolean
         default: true
@@ -98,7 +102,8 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:16
+        # An empty image skips the service (documented), so postgres-service: false drops it.
+        image: ${{ inputs.postgres-service && 'postgres:16' || '' }}
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
@@ -134,7 +139,8 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:16
+        # An empty image skips the service (documented), so postgres-service: false drops it.
+        image: ${{ inputs.postgres-service && 'postgres:16' || '' }}
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
