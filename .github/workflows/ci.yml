@@ -77,6 +77,18 @@ on:
         description: Neon branch that e2e branches are created from. Overrides NEON_CI_PARENT_BRANCH (variable). Required when has-e2e is true, so CI never silently copies the production branch.
         type: string
         default: ""
+      e2e-neon-parent:
+        description: Neon branch the e2e branch is created from, for e2e only. Overrides neon-parent and NEON_CI_PARENT_BRANCH; empty falls back to them. Never point it at production.
+        type: string
+        default: ""
+      e2e-branch-expires-minutes:
+        description: Minutes until the e2e Neon branch expires on its own (create-branch-action expires_at), so a killed run cannot leak it. 0 disables expiry. Keep it above the e2e job timeout (45) plus queue time; 120 is a good value.
+        type: number
+        default: 0
+      e2e-cleanup-stale:
+        description: Before creating the e2e branch, delete leftover ci/e2e-pr<N>-* branches of the same PR whose run has finished (or that are over 2h old), and delete this run's branch by name when branch creation itself failed. Frees Neon branch slots; the finished-run check needs actions read permission, else it falls back to age.
+        type: boolean
+        default: false
       e2e-better-auth-url:
         description: BETTER_AUTH_URL for the e2e server. Empty leaves it unset.
         type: string
@@ -264,6 +276,7 @@ jobs:
           RUN_ID: ${{ github.run_id }}
           RUN_ATTEMPT: ${{ github.run_attempt }}
           GIT_SHA: ${{ github.sha }}
+          EXPIRES_MINUTES: ${{ inputs.e2e-branch-expires-minutes }}
         run: |
           if [ "$EVENT_NAME" = "pull_request" ]; then
             printf 'name=ci/e2e-pr%s-%s-%s\n' "$PR_NUMBER" "$RUN_ID" "$RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
@@ -271,17 +284,68 @@ jobs:
             printf 'name=ci/e2e-%s\n' "$GIT_SHA" >> "$GITHUB_OUTPUT"
           fi
           printf 'ephemeral=true\n' >> "$GITHUB_OUTPUT"
+          if [ "${EXPIRES_MINUTES:-0}" -gt 0 ]; then
+            printf 'expires_at=%s\n' "$(date -u -d "+${EXPIRES_MINUTES} minutes" +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+          fi
 
       # Without an explicit parent, Neon copies the project's default branch,
       # which is production data. Fail instead of silently doing that.
       - name: Require Neon CI parent branch
         env:
-          NEON_PARENT: ${{ inputs.neon-parent || vars.NEON_CI_PARENT_BRANCH }}
+          NEON_PARENT: ${{ inputs.e2e-neon-parent || inputs.neon-parent || vars.NEON_CI_PARENT_BRANCH }}
         run: |
           if [ -z "$NEON_PARENT" ]; then
             echo "::error::Set the NEON_CI_PARENT_BRANCH repository variable (or the neon-parent input) to a seeded/scrubbed Neon branch. PR branches must not be copied from production."
             exit 1
           fi
+
+      # Opt-in (e2e-cleanup-stale). Frees Neon branch slots held by e2e branches
+      # that earlier runs of this PR leaked (runner lost, force-cancelled). A
+      # branch is stale when its run is completed, when it is from an earlier
+      # attempt of this run, or, if the run lookup fails, when it is over 2h old
+      # (longer than the job timeout), so a live run's branch is never deleted.
+      # Only this PR's ci/e2e-pr<N>-* names are considered. The name pieces are
+      # validated as digits before use and reach commands through env only.
+      - name: Delete stale e2e Neon branches
+        if: inputs.e2e-cleanup-stale && github.event_name == 'pull_request'
+        continue-on-error: true
+        env:
+          NEON_API_KEY: ${{ secrets.NEON_API_KEY }}
+          NEON_PROJECT_ID: ${{ secrets.NEON_PROJECT_ID || vars.NEON_PROJECT_ID }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.number }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          OWN_BRANCH: ${{ steps.neon.outputs.name }}
+        run: |
+          npm i -g neonctl@2.47.0 >/dev/null
+          rows="$(neonctl branches list --project-id "$NEON_PROJECT_ID" --output json \
+            | jq -r --arg p "ci/e2e-pr${PR_NUMBER}-" 'if type == "array" then .[] | select(.name | startswith($p)) | "\(.id)\t\(.name)\t\(.created_at)" else error("neonctl branches list did not return an array") end')"
+          now="$(date +%s)"
+          while IFS=$'\t' read -r id name created; do
+            [ -n "$id" ] || continue
+            [ "$name" = "$OWN_BRANCH" ] && continue
+            rest="${name#ci/e2e-pr"${PR_NUMBER}"-}"
+            run="${rest%%-*}"
+            attempt="${rest#*-}"
+            [[ "$run" =~ ^[0-9]+$ && "$attempt" =~ ^[0-9]+$ ]] || continue
+            reason=""
+            if [ "$run" = "$RUN_ID" ] && [ "$attempt" -lt "$RUN_ATTEMPT" ]; then
+              reason="earlier attempt of this run"
+            elif status="$(gh api "repos/$GH_REPO/actions/runs/$run" --jq .status 2>/dev/null)"; then
+              [ "$status" = completed ] && reason="run $run is completed"
+            else
+              ts="$(date -d "$created" +%s 2>/dev/null)" || continue
+              [ $((now - ts)) -ge 7200 ] && reason="run $run not readable and branch is over 2h old"
+            fi
+            [ -n "$reason" ] || continue
+            if neonctl branches delete "$id" --project-id "$NEON_PROJECT_ID" >/dev/null; then
+              echo "Deleted stale $name: $reason"
+            else
+              echo "::warning::Could not delete stale $name"
+            fi
+          done <<<"$rows"
 
       - name: Create Neon branch
         id: database
@@ -289,7 +353,8 @@ jobs:
         with:
           project_id: ${{ secrets.NEON_PROJECT_ID || vars.NEON_PROJECT_ID }}
           branch_name: ${{ steps.neon.outputs.name }}
-          parent_branch: ${{ inputs.neon-parent || vars.NEON_CI_PARENT_BRANCH }}
+          parent_branch: ${{ inputs.e2e-neon-parent || inputs.neon-parent || vars.NEON_CI_PARENT_BRANCH }}
+          expires_at: ${{ steps.neon.outputs.expires_at }}
           api_key: ${{ secrets.NEON_API_KEY }}
           database: ${{ inputs.neon-database || secrets.NEON_DATABASE || vars.NEON_DATABASE || 'neondb' }}
           role: ${{ inputs.neon-role || secrets.NEON_ROLE || vars.NEON_ROLE || 'neondb_owner' }}
@@ -371,3 +436,22 @@ jobs:
           project_id: ${{ secrets.NEON_PROJECT_ID || vars.NEON_PROJECT_ID }}
           branch: ${{ steps.database.outputs.branch_id }}
           api_key: ${{ secrets.NEON_API_KEY }}
+
+      # create-branch-action can fail after Neon already made the branch (for
+      # example while waiting for the endpoint), which the step above skips
+      # because it needs a branch ID. Delete by name in that case.
+      - name: Delete e2e Neon branch after a failed create
+        if: always() && inputs.e2e-cleanup-stale && steps.neon.outputs.ephemeral == 'true' && steps.database.outcome == 'failure'
+        env:
+          NEON_API_KEY: ${{ secrets.NEON_API_KEY }}
+          NEON_PROJECT_ID: ${{ secrets.NEON_PROJECT_ID || vars.NEON_PROJECT_ID }}
+          BRANCH: ${{ steps.neon.outputs.name }}
+        run: |
+          npm i -g neonctl@2.47.0 >/dev/null
+          if out=$(neonctl branches delete "$BRANCH" --project-id "$NEON_PROJECT_ID" 2>&1); then
+            echo "$out"
+          elif grep -qi 'not found' <<<"$out"; then
+            echo "No Neon branch $BRANCH; nothing to delete."
+          else
+            echo "::warning::Could not delete $BRANCH: $out"
+          fi

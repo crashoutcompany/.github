@@ -67,6 +67,16 @@
 # branch so that build is harmless, and redeploy (or push) for the PR's own
 # branch. PRs opened before this was turned on get their vars on reopen.
 #
+# Drafts (opt-in, `skip-drafts: true`): Neon allows few branches per project and
+# every open PR, drafts included, holds one, so bot-opened drafts can exhaust the
+# limit. With this on, no preview branch is created while a PR is a draft; it is
+# created on `ready_for_review` and deleted again (with its Vercel env vars) on
+# `converted_to_draft`, through the same delete job as `closed`. The caller must
+# list both types, `ready_for_review` and `converted_to_draft`, in
+# `pull_request.types`; `converted_to_draft` is a `pull_request` event and only
+# calls the Neon/Vercel APIs, never PR code. Branches that already exist for
+# open drafts are not removed until the PR is converted or closed (or swept).
+#
 # Preview branches also expire `expires-in-days` days (default 30) after creation,
 # as a safety net for PRs abandoned without being closed. This workflow only runs
 # on open/reopen/close, so a PR left open longer than that loses its preview
@@ -104,6 +114,10 @@ on:
         description: Days until a preview branch expires. 0 disables expiry.
         type: number
         default: 30
+      skip-drafts:
+        description: Do not create a preview branch while the PR is a draft; create it on ready_for_review and delete it on converted_to_draft. The caller's pull_request types must include ready_for_review and converted_to_draft.
+        type: boolean
+        default: false
       vercel-preview-env:
         description: Publish the PR branch's Neon URLs as Vercel preview env vars for the PR's head ref, and remove them on close.
         type: boolean
@@ -120,7 +134,7 @@ on:
 jobs:
   create:
     # Also check the PR author: a human re-run of a Dependabot PR makes the human the actor.
-    if: github.event.action != 'closed' && github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]' && github.event.pull_request.user.login != 'dependabot[bot]'
+    if: github.event.action != 'closed' && github.event.action != 'converted_to_draft' && !(inputs.skip-drafts && github.event.pull_request.draft) && github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]' && github.event.pull_request.user.login != 'dependabot[bot]'
     runs-on: ubuntu-latest
     # One run per PR at a time, so rapid pushes migrate in order and a close
     # waits for a running create.
@@ -299,7 +313,7 @@ jobs:
   delete:
     # Dependabot-triggered events get Dependabot's secrets, not the repository's,
     # so there is no Neon key to delete with.
-    if: github.event.action == 'closed' && github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]' && github.event.pull_request.user.login != 'dependabot[bot]'
+    if: (github.event.action == 'closed' || (github.event.action == 'converted_to_draft' && inputs.skip-drafts)) && github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]' && github.event.pull_request.user.login != 'dependabot[bot]'
     runs-on: ubuntu-latest
     concurrency:
       group: neon-branches-${{ github.repository }}-${{ github.event.number }}
