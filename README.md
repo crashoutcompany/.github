@@ -103,3 +103,12 @@ git tag v2 && git push origin v2              # breaking; bump callers one at a 
   service container. Set `false` for an app with no database (Project-View) to
   skip it. The service's `image` is an expression that is `''` when off;
   GitHub documents that a service whose image is an empty string does not start.
+- `dependabot-build` (default `false`): by default build and e2e skip Dependabot
+  PRs because they need secrets, so a bump merges on lint and unit tests only.
+  With `true`, the build job also runs for Dependabot (or a human re-run of its
+  PR) without `vercel pull`/`vercel build`: it runs
+  `pnpm run <dependabot-build-script>` (default `build`) with placeholder env.
+  `dependabot-build-env` is a multiline `KEY=VALUE` list (e.g. public
+  `NEXT_PUBLIC_*` values the build needs); `DATABASE_URL`, `DIRECT_URL`,
+  `BETTER_AUTH_SECRET` and `TEST_AUTH_SECRET` default to the CI fixtures. e2e
+  stays skipped for Dependabot. The build output is never deployed.

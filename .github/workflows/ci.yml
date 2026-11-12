@@ -9,7 +9,8 @@
 #
 # Jobs: lint (+ typecheck) -> unit tests -> Vercel build -> Playwright e2e on a
 # Neon branch. Build and e2e are skipped for fork PRs and Dependabot because
-# they need repository secrets.
+# they need repository secrets. With `dependabot-build: true` the build job also
+# runs for Dependabot, as a plain build script with placeholder env.
 #
 # Secrets / variables read from the calling repository:
 #   VERCEL_TOKEN, VERCEL_ORG_ID, VERCEL_PROJECT_ID   (build)
@@ -89,7 +90,18 @@ on:
         description: Space-separated repository secret names to expose to the e2e job.
         type: string
         default: ""
-
+      dependabot-build:
+        description: Also run the build job for Dependabot PRs. Dependabot runs have no Actions secrets, so it skips `vercel pull`/`vercel build` and runs the caller's package.json script from `dependabot-build-script` with placeholder env. e2e stays skipped for Dependabot.
+        type: boolean
+        default: false
+      dependabot-build-script:
+        description: package.json script run by the Dependabot build (only when dependabot-build is true).
+        type: string
+        default: build
+      dependabot-build-env:
+        description: Placeholder env for the Dependabot build, one KEY=VALUE per line (blank lines and # comments ignored). Not secrets. DATABASE_URL, DIRECT_URL, BETTER_AUTH_SECRET and TEST_AUTH_SECRET default to the CI fixtures.
+        type: string
+        default: ""
 env:
   # Fixtures for lint/test against the job's Postgres service. Not real secrets.
   DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/ci?schema=public
@@ -170,7 +182,7 @@ jobs:
       - run: pnpm ${{ inputs.test-script }}
 
   build:
-    if: inputs.has-build && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]'))
+    if: inputs.has-build && (github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && (github.actor != 'dependabot[bot]' || inputs.dependabot-build)))
     runs-on: ubuntu-latest
     env:
       VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
@@ -182,6 +194,8 @@ jobs:
       DIRECT_URL: ${{ secrets.DIRECT_URL }}
       BETTER_AUTH_SECRET: ${{ secrets.BETTER_AUTH_SECRET }}
       TEST_AUTH_SECRET: ${{ secrets.TEST_AUTH_SECRET }}
+      # Dependabot (or a re-run of its PR) has no repository secrets: build with placeholders instead of Vercel.
+      DEPENDABOT_BUILD: ${{ inputs.dependabot-build && github.event_name == 'pull_request' && (github.actor == 'dependabot[bot]' || github.event.pull_request.user.login == 'dependabot[bot]') }}
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -201,6 +215,7 @@ jobs:
       - run: pnpm install --frozen-lockfile ${{ inputs.install-flags }}
       - run: pnpm add --global vercel@latest
       - name: Pull Vercel environment and build
+        if: env.DEPENDABOT_BUILD != 'true'
         run: |
           # `vercel build` never overrides a variable that is already set, even
           # to "", so only keep the repo secrets that actually have a value.
@@ -232,6 +247,30 @@ jobs:
           else
             vercel build --token="$VERCEL_TOKEN"
           fi
+
+      # No secrets and no Vercel: a compile check of the dependency bump with
+      # placeholder env, through the caller's own build script.
+      - name: Build (Dependabot, placeholder env)
+        if: env.DEPENDABOT_BUILD == 'true'
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/ci?schema=public
+          DIRECT_URL: postgresql://postgres:postgres@127.0.0.1:5432/ci?schema=public
+          BETTER_AUTH_SECRET: ci-only-better-auth-secret-at-least-32-characters
+          TEST_AUTH_SECRET: ci-only-test-auth-secret
+          PLACEHOLDER_ENV: ${{ inputs.dependabot-build-env }}
+          BUILD_SCRIPT: ${{ inputs.dependabot-build-script }}
+        run: |
+          while IFS= read -r line || [ -n "$line" ]; do
+            line="${line%$'\r'}"
+            case "$line" in ''|'#'*) continue ;; esac
+            key="${line%%=*}"
+            if [[ "$line" != *=* || ! "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+              echo "::error::dependabot-build-env: expected KEY=VALUE, got a bad line"
+              exit 1
+            fi
+            export "$key=${line#*=}"
+          done <<<"$PLACEHOLDER_ENV"
+          pnpm run "$BUILD_SCRIPT"
 
   e2e:
     # Also check the PR author: a human re-run of a Dependabot PR makes the human the actor.
