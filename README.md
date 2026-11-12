@@ -52,12 +52,36 @@ for `ci.yml`.
   `24` / `10.1.0`, as in `ci.yml`. Without it, a PR that changes the schema
   gets a preview on the parent's schema.
 
+- **Drafts.** Neon allows few branches per project and each open PR holds one,
+  drafts included, so many bot-opened drafts can hit the limit (and then
+  `ci.yml`'s e2e "Create Neon branch" fails). With `skip-drafts: true`, no
+  preview branch is made for a draft PR; it is created on `ready_for_review`
+  and deleted (with its Vercel env vars) on `converted_to_draft`. The caller
+  must add `ready_for_review` and `converted_to_draft` to `pull_request.types`.
+  Default `false` keeps the current behavior. Existing draft branches stay
+  until the PR is converted, closed or swept.
+
+## e2e Neon branch hygiene
+
+`ci.yml`'s e2e job always creates its own `ci/e2e-*` branch and deletes it in an
+`always()` step (also on failure and cancel). New opt-in inputs, all defaulting
+to the previous behavior:
+
+| Input | Default | Effect |
+|---|---|---|
+| `e2e-neon-parent` | `""` | Parent for the e2e branch only; falls back to `neon-parent`, then `NEON_CI_PARENT_BRANCH`. |
+| `e2e-branch-expires-minutes` | `0` (off) | Sets `expires_at` so a branch leaked by a killed runner expires itself. Use `120` (above the 45 min job timeout). |
+| `e2e-cleanup-stale` | `false` | Before creating the branch, delete this PR's leftover `ci/e2e-pr<N>-*` branches whose run has completed (or that are over 2h old if the run cannot be read); also delete this run's branch by name if creation itself failed. |
+
+`neon-sweep.yml` already deletes `ci/e2e-*` branches older than
+`ephemeral-max-age-hours` (default 6); pass `2` to reclaim slots sooner.
+
 Caller:
 
 ```yaml
 on:
   pull_request:
-    types: [opened, reopened, synchronize]
+    types: [opened, reopened, synchronize, ready_for_review, converted_to_draft]
   pull_request_target:
     types: [closed]
 jobs:
@@ -66,6 +90,7 @@ jobs:
     with:
       vercel-preview-env: true
       prisma-migrate: true
+      skip-drafts: true # needs ready_for_review + converted_to_draft in the types above
     secrets: inherit
   sweep:
     uses: crashoutcompany/.github/.github/workflows/neon-sweep.yml@<full commit sha> # v1
