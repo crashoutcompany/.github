@@ -283,7 +283,7 @@ jobs:
       # get the direct URL, as in ci.yml.
       - name: Check out PR
         if: inputs.prisma-migrate
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: Set up pnpm
