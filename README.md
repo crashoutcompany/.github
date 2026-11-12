@@ -74,6 +74,19 @@ jobs:
     secrets: inherit
 ```
 
+## Pinned dependencies
+
+Third-party actions inside the shared workflows (`neondatabase/*`,
+`millionco/react-doctor`, `pnpm/action-setup`) are pinned to full commit SHAs
+with the release as a comment, because they run with the Neon key or
+`pull-requests: write`. `.github/dependabot.yml` (`github-actions` ecosystem)
+proposes bumps. GitHub-owned `actions/*` stay on major tags.
+
+`ci.yml` installs the Vercel CLI at the exact version of its `vercel-version`
+input (default `65.14.0`) instead of `@latest`, since that job holds
+`VERCEL_TOKEN`. Dependabot cannot see it; bump the default here, or pass
+`vercel-version` from a caller, on purpose.
+
 ## Releasing
 
 Callers should pin a full commit SHA with the version as a comment, not the
